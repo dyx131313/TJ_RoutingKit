@@ -1,0 +1,12 @@
+{
+  "name": "tj_routing_app_node",
+  "version": "1.0.0",
+  "description": "Node.js API gateway and static server for TJ_RoutingKit offline routing demo",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "express-status-monitor": "^1.3.4"
+  }
+}

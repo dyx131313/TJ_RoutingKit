@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <cmath>
 #include "edge_weight.h"
 #include "rule_registry.h"
 #include "mapper.h"

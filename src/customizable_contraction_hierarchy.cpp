@@ -15,6 +15,8 @@
 #include <assert.h>
 #include <algorithm>
 #include <stdexcept>
+#include <iostream>
+#include <cstdlib>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -22,6 +24,8 @@
 namespace RoutingKit{
 
 namespace{
+	static bool CCH_QUERY_DEBUG_ENABLED = false;
+
 	template<class OnNewArc>
 	unsigned compute_chordal_supergraph(unsigned node_count, const std::vector<unsigned>&tail, const std::vector<unsigned>&head, const OnNewArc&on_new_arc){
 		std::vector<std::vector<unsigned>> nodes(node_count);
@@ -1221,12 +1225,28 @@ namespace{
 CustomizableContractionHierarchyQuery& CustomizableContractionHierarchyQuery::run(){
 	assert(state == query_state_initialized);
 
+	// const char* debug_env = std::getenv("ROUTING_KIT_DEBUG");
+    // if (debug_env != nullptr && std::string(debug_env) == "1") {
+    //     CCH_QUERY_DEBUG_ENABLED = true;
+    // } else {
+	// 	CCH_QUERY_DEBUG_ENABLED = false;
+	// }
+
+	// if (CCH_QUERY_DEBUG_ENABLED) {
+    //     std::cerr << "\n[CCH_DEBUG] --- New Query Run ---" << std::endl;
+    //     std::cerr << "[CCH_DEBUG] Sources: ";
+    //     for(unsigned s : source_node) std::cerr << cch->order[s] << " ";
+    //     std::cerr << "| Targets: ";
+    //     for(unsigned t : target_node) std::cerr << cch->order[t] << " ";
+    //     std::cerr << std::endl;
+    // }
+
 	for(unsigned i = source_node.size()-1; i!=(unsigned)-1; --i){
 		forall_ancestors(
 			cch->elimination_tree_parent,
 			source_node[i], source_elimination_tree_end[i],
 			[&](unsigned x){
-
+				// if (CCH_QUERY_DEBUG_ENABLED) std::cerr << "[CCH_DEBUG] Forward relaxing from node " << cch->order[x] << " (rank " << x << ")" << std::endl;
 				relax_outgoing_arcs(
 					cch->up_first_out, cch->up_head, metric->forward,
 					forward_tentative_distance, [&](unsigned a, unsigned b){forward_predecessor_node[a] = b;},
@@ -1252,14 +1272,18 @@ CustomizableContractionHierarchyQuery& CustomizableContractionHierarchyQuery::ru
 			cch->elimination_tree_parent,
 			target_node[i], target_elimination_tree_end[i],
 			[&](unsigned x){
+				// if (CCH_QUERY_DEBUG_ENABLED) std::cerr << "[CCH_DEBUG] Backward relaxing from node " << cch->order[x] << " (rank " << x << ")" << std::endl;
 				relax_outgoing_arcs(
 					cch->up_first_out, cch->up_head, metric->backward,
 					backward_tentative_distance, [&](unsigned a, unsigned b){backward_predecessor_node[a] = b;},
 					x
 				);
+				// if (CCH_QUERY_DEBUG_ENABLED) std::cerr << "[CCH_DEBUG]   Node " << cch->order[x] << ": in_forward_search_space? " << (in_forward_search_space[x] ? "Yes" : "No") << ". Current shortest path: " << shortest_path_length << std::endl;
 				if(in_forward_search_space[x]){
 					unsigned l = forward_tentative_distance[x] + backward_tentative_distance[x];
+					// if (CCH_QUERY_DEBUG_ENABLED) std::cerr << "[CCH_DEBUG]     -> Meeting point! Tentative dist: " << l << std::endl;
 					if(l < shortest_path_length){
+						// if (CCH_QUERY_DEBUG_ENABLED) std::cerr << "[CCH_DEBUG]       -> New shortest path found!" << std::endl;
 						shortest_path_length = l;
 						shortest_path_meeting_node = x;
 					}
@@ -1268,6 +1292,16 @@ CustomizableContractionHierarchyQuery& CustomizableContractionHierarchyQuery::ru
 			}
 		);
 	}
+
+	// if (CCH_QUERY_DEBUG_ENABLED) {
+    //     std::cerr << "[CCH_DEBUG] --- Query Finished ---" << std::endl;
+    //     if(shortest_path_meeting_node != invalid_id){
+    //         std::cerr << "[CCH_DEBUG] Final meeting node: " << cch->order[shortest_path_meeting_node] << " (rank " << shortest_path_meeting_node << ")" << std::endl;
+    //         std::cerr << "[CCH_DEBUG] Final distance: " << shortest_path_length << std::endl;
+    //     } else {
+    //         std::cerr << "[CCH_DEBUG] No path found." << std::endl;
+    //     }
+    // }
 
 //	for(unsigned x=0; x < cch->node_count(); ++x){
 //		unsigned l = forward_tentative_distance[x] + backward_tentative_distance[x];

@@ -8,7 +8,7 @@ archiver_name = "ar"
 # "-DROUTING_KIT_NO_GCC_EXTENSIONS", "-DROUTING_KIT_NO_POSIX", "-DROUTING_KIT_NO_ALIGNED_ALLOC"
 #compiler_options = ["-Wall", "-O0", "-ggdb","-march=native", "-ffast-math", "-std=c++17", "-D_GLIBCXX_DEBUG"]
 compiler_options = ["-Wall", "-DNDEBUG", "-march=native", "-ffast-math", "-std=c++17", "-O3"]
-linker_options = []
+linker_options = ["-lz"]
 
 build_static_library = True
 build_dynamic_library = True
@@ -21,11 +21,14 @@ import os
 import re
 import sys
 
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
 def uniquify(l):
 	return sorted(list(set(l)))
 
 if not os.path.exists("src"):
-	print("No src/ subdirectory found => no source code found => nothing to do")
+	eprint("No src/ subdirectory found => no source code found => nothing to do")
 	sys.exit(1)
 
 def does_cpp_file_contains_main(file_name):
@@ -61,7 +64,7 @@ def uncached_extract_direct_includes_from_source_file(file_name):
 			if m:
 				local_header = os.path.join("src", m.group(1))
 				if not local_header in h_files:
-					print("\""+file_name+"\" includes inexistent header \""+local_header+"\" => abort")
+					eprint("\""+file_name+"\" includes inexistent header \""+local_header+"\" => abort")
 					sys.exit(1)
 				else:
 					local_includes.append(local_header)
@@ -89,7 +92,7 @@ def extract_includes(file_name):
 
 		for i in direct_local_includes:
 			if not i in h_files:
-				print("Header \""+i+"\" missing but included from \""+file_name+"\" => aborting")
+				eprint("Header \""+i+"\" missing but included from \""+file_name+"\" => aborting")
 				sys.exit(1)
 			if i != file_name:
 				i_local_includes, i_global_includes = extract_includes(i)
@@ -107,7 +110,7 @@ def extract_includes(file_name):
 		include_cache[file_name] = (local_includes, global_includes)
 				
 	if include_cache[file_name] is None:
-		print("Cyclic include detected while parsing \""+file_name+"\" => aborting")
+		eprint("Cyclic include detected while parsing \""+file_name+"\" => aborting")
 		sys.exit(1)
 
 	return include_cache[file_name]
@@ -187,7 +190,7 @@ def extract_cpp_dependency(file_name):
 		
 
 	if cpp_dependency_cache[file_name] is None:
-		print("Cyclic cpp dependency detected while resolving dependencies of \""+file_name+"\" => aborting")
+		eprint("Cyclic cpp dependency detected while resolving dependencies of \""+file_name+"\" => aborting")
 		sys.exit(1)
 
 	return cpp_dependency_cache[file_name]
@@ -283,7 +286,7 @@ with open("Makefile", "w") as f:
 	for bin_file in bin_files + lib_files:
 		depends_on_cpp_files = extract_cpp_dependency(bin_file)
 		if len(depends_on_cpp_files) == 0:
-			print("Not generating a target for \""+bin_file+"\" because it does not depend on any *.cpp file.")
+			eprint("Not generating a target for \""+bin_file+"\" because it does not depend on any *.cpp file.")
 		else:
 
 			extra_linker_options = []
@@ -306,11 +309,14 @@ with open("Makefile", "w") as f:
 				print("\t@mkdir -p lib", file=f)
 				print("\t$(AR) rcs "+bin_file + " " + " ".join(depends_on_object_files), file=f)
 				if len(extra_linker_options) != 0:
-					print("When linking against \""+bin_file+"\" you need to add \""+" ".join(extra_linker_options)+"\" to the linker as the last commandline options.")
+					eprint("When linking against \""+bin_file+"\" you need to add \""+" ".join(extra_linker_options)+"\" to the linker as the last commandline options.")
 			else:	
 				print("\t@mkdir -p bin", file=f)
 				print("\t$(CC) $(LDFLAGS) "+" ".join(depends_on_object_files+extra_linker_options)+" "+" -o "+bin_file, file=f)
 			print("", file=f)
 
-print("Successfully generated Makefile.")
+	print("clean:", file=f)
+	print("\trm -rf build/* bin/* lib/*", file=f)
+
+eprint("Successfully generated Makefile.")
 

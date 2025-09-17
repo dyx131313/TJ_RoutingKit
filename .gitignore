@@ -1,3 +1,33 @@
-bin/
-build/
-lib/
+# Build artifacts
+/build/
+/bin/
+/lib/
+/*.o
+*.so
+*.a
+
+# C++ binaries and intermediates
+app_backend/routing_server
+app_backend/*.o
+app_backend/*.exe
+
+# Node.js
+app_node/node_modules/
+app_node/package-lock.json
+
+# Data and tiles (不要把 PBF/瓦片推送)
+data/
+tiles/
+*.pbf
+*.osm.pbf
+
+# Editor/OS
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Logs and temporary files
+*.log
+tmp/

@@ -1,0 +1,128 @@
+<!-- ...existing code from frontend/index.html... -->
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>上海离线地图路由演示</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Arial", sans-serif;
+      background: #f7f7f7;
+    }
+    .navbar {
+      background: #2d8cf0;
+      color: #fff;
+      padding: 16px 32px;
+      font-size: 1.3em;
+      letter-spacing: 1px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      padding: 16px 32px;
+      background: #fff;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+      align-items: center;
+    }
+    .controls input {
+      padding: 8px 12px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 1em;
+      width: 180px;
+    }
+    .controls select {
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 1em;
+    }
+    .controls button {
+      padding: 8px 24px;
+      background: #2d8cf0;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 1em;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .controls button:hover {
+      background: #1765ad;
+    }
+    #map {
+      height: 70vh;
+      width: 100vw;
+      margin: 0;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    }
+    .result {
+      padding: 16px 32px;
+      background: #fff;
+      margin-top: 8px;
+      font-size: 1em;
+      color: #333;
+      border-radius: 4px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+    }
+  </style>
+</head>
+<body>
+  <div class="navbar">上海离线地图路由演示</div>
+  <div class="controls">
+    <label>起点(纬度,经度): <input id="from" type="text" value="31.2335,121.4750"></label>
+    <label>终点(纬度,经度): <input id="to" type="text" value="31.2400,121.4998"></label>
+    <label>交通模式:
+      <select id="profile">
+        <option value="normal">正常</option>
+        <option value="morning_peak">早高峰</option>
+        <option value="evening_peak">晚高峰</option>
+      </select>
+    </label>
+    <button onclick="route()">查询路径</button>
+  </div>
+  <div id="map"></div>
+  <div class="result" id="result"></div>
+  <script>
+    var map = L.map('map').setView([31.2304, 121.4737], 12);
+    L.tileLayer('http://localhost:3000/tiles/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap（本地离线）'
+    }).addTo(map);
+    var polyline;
+
+    function route() {
+      var from = document.getElementById('from').value.trim();
+      var to = document.getElementById('to').value.trim();
+      var profile = document.getElementById('profile').value;
+      if (!from || !to) {
+        document.getElementById('result').innerText = '请输入起点和终点坐标';
+        return;
+      }
+      document.getElementById('result').innerText = '正在查询...';
+      fetch(`/route?from=${from}&to=${to}&profile=${profile}`)
+        .then(r => r.json())
+        .then(data => {
+          if (polyline) {
+            map.removeLayer(polyline);
+          }
+          if (data.error) {
+            document.getElementById('result').innerText = '错误: ' + data.error;
+          } else {
+            document.getElementById('result').innerText = `距离: ${data.distance_meters} 米`;
+            polyline = L.polyline(data.path_coordinates, {color: 'red', weight: 5}).addTo(map);
+            map.fitBounds(polyline.getBounds());
+          }
+        })
+        .catch(e => {
+          document.getElementById('result').innerText = '请求失败: ' + e;
+        });
+    }
+  </script>
+</body>
+</html>
