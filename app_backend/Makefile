@@ -8,7 +8,7 @@ CXXFLAGS = -std=c++17 -O3 -Wall -I./include -I../../TJ_RoutingKit/include
 # -lroutingkit links the library
 # -Wl,-rpath embeds the library path so the executable can find it at runtime
 # -pthread is required by httplib
-LDFLAGS = -L../../TJ_RoutingKit/lib -lroutingkit -Wl,-rpath,../../TJ_RoutingKit/lib -pthread
+LDFLAGS = -L../../TJ_RoutingKit/lib -lroutingkit -Wl,-rpath,../../TJ_RoutingKit/lib -pthread -lcrypto
 
 # Source, object, and target files
 SRC_SERVER = routing_server.cpp
@@ -23,20 +23,15 @@ SRC_TEST_CLIENT = test_client.cpp
 OBJ_TEST_CLIENT = $(SRC_TEST_CLIENT:.cpp=.o)
 TARGET_TEST_CLIENT = test_client
 
-# Default target
-all: $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_TEST_CLIENT)
+# Default target: only build the server by default
+all: $(TARGET_SERVER)
 
 # Rule to build the server executable
 $(TARGET_SERVER): $(OBJ_SERVER)
 	$(CXX) $(CXXFLAGS) -o $(TARGET_SERVER) $(OBJ_SERVER) $(LDFLAGS)
 
-# Rule to build the client executable
-$(TARGET_CLIENT): $(OBJ_CLIENT)
-	$(CXX) $(CXXFLAGS) -o $(TARGET_CLIENT) $(OBJ_CLIENT)
 
-# Rule to build the test client executable
-$(TARGET_TEST_CLIENT): $(OBJ_TEST_CLIENT)
-	$(CXX) $(CXXFLAGS) -o $(TARGET_TEST_CLIENT) $(OBJ_TEST_CLIENT)
+# (Optional) client/test targets omitted by default. Add them if sources are present.
 
 # Rule to compile source files into object files
 %.o: %.cpp
@@ -44,5 +39,5 @@ $(TARGET_TEST_CLIENT): $(OBJ_TEST_CLIENT)
 
 # Clean rule
 clean:
-	rm -f $(OBJ_SERVER) $(TARGET_SERVER) $(OBJ_CLIENT) $(TARGET_CLIENT) $(OBJ_TEST_CLIENT) $(TARGET_TEST_CLIENT)
+	rm -f $(OBJ_SERVER) $(TARGET_SERVER)
 

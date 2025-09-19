@@ -1,0 +1,38 @@
+{
+  "examples": [
+    {
+      "name": "早高峰货车禁行",
+      "description": "07:00-09:00 禁止货车进入市中心指定路段",
+      "precedence": 100,
+      "rules": [
+        {
+          "description": "禁行部分弧（示例）",
+          "filter": { "arc_ids": [1234, 1235, 1236] },
+          "action": { "forbid": true }
+        }
+      ]
+    },
+    {
+      "name": "避开收费路段",
+      "description": "对所有带 toll=yes 的道路加大权重",
+      "precedence": 10,
+      "rules": [
+        {
+          "filter": { "way_tags": { "toll": ["yes"] } },
+          "action": { "weight_multiplier": 3.0 }
+        }
+      ]
+    },
+    {
+      "name": "避开活动场地",
+      "description": "以多边形形式避开某活动场地（示例）",
+      "precedence": 200,
+      "rules": [
+        {
+          "filter": { "polygon": { "type": "Polygon", "coordinates": [ [ [121.47,31.22], [121.48,31.22], [121.48,31.23], [121.47,31.23], [121.47,31.22] ] ] } },
+          "action": { "forbid": true }
+        }
+      ]
+    }
+  ]
+}

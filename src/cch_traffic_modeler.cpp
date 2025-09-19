@@ -114,4 +114,9 @@ std::vector<unsigned> CCHTrafficModeler::generate_weights_for_profile(TrafficPro
     return final_weights;
 }
 
+// Public wrapper implementation to expose weight generation to callers
+std::vector<unsigned> CCHTrafficModeler::generate_weights_for_profile_for_bucket(TrafficProfile profile){
+    return generate_weights_for_profile(profile);
+}
+
 } // namespace RoutingKit

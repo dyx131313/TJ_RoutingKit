@@ -3,7 +3,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>上海离线地图路由演示</title>
+  <title>CCH_Restriction演示</title>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
@@ -24,8 +24,9 @@
     }
     .controls {
       display: flex;
-      gap: 12px;
-      padding: 16px 32px;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 12px 20px;
       background: #fff;
       box-shadow: 0 2px 8px rgba(0,0,0,0.03);
       align-items: center;
@@ -42,8 +43,9 @@
       border-radius: 4px;
       font-size: 1em;
     }
-    .controls button {
-      padding: 8px 24px;
+    /* Primary action button inside controls */
+    .controls .btn-primary {
+      padding: 8px 18px;
       background: #2d8cf0;
       color: #fff;
       border: none;
@@ -52,8 +54,21 @@
       cursor: pointer;
       transition: background 0.2s;
     }
-    .controls button:hover {
-      background: #1765ad;
+    .controls .btn-primary:hover { background: #1765ad; }
+    .btn-select {
+      background: #f0f0f0;
+      color: #333;
+      border: 1px solid #d0d0d0;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-left: 6px;
+    }
+    .btn-select.active {
+      background: #2d8cf0;
+      color: #fff;
+      border-color: #1765ad;
+      box-shadow: 0 2px 6px rgba(29,100,170,0.2);
     }
     #map {
       height: 70vh;
@@ -73,7 +88,7 @@
   </style>
 </head>
 <body>
-  <div class="navbar">上海离线地图路由演示</div>
+  <div class="navbar">CCH_Restriction演示</div>
   <div class="controls">
     <label>起点(纬度,经度): <input id="from" type="text" value="31.2335,121.4750"></label>
     <label>终点(纬度,经度): <input id="to" type="text" value="31.2400,121.4998"></label>
@@ -84,7 +99,23 @@
         <option value="evening_peak">晚高峰</option>
       </select>
     </label>
-    <button onclick="route()">查询路径</button>
+    <button class="btn-primary" onclick="route()">查询路径</button>
+  <button id="selFromBtn" class="btn-select" onclick="selectMode('from')">选择 起点</button>
+  <button id="selToBtn" class="btn-select" onclick="selectMode('to')">选择 终点</button>
+  <button id="drawPolyBtn" class="btn-select" onclick="toggleDrawPoly()">绘制 多边形</button>
+  <button id="previewPolyBtn" class="btn-primary" onclick="previewPolygon()">预览影响</button>
+  <label>模板类型:
+    <select id="templateType">
+      <option value="polygon">polygon</option>
+      <option value="arc_ids">arc_ids</option>
+      <option value="tag_filter">tag_filter</option>
+    </select>
+  </label>
+  <label id="arcIdsLabel" style="display:none;">Arc IDs (逗号分隔): <input id="arcIdsInput" type="text" placeholder="例如: 123,456,789" style="width:220px"></label>
+  <label id="tagFilterLabel" style="display:none;">Tag 过滤: Key <input id="tagKey" type="text" placeholder="例如: highway" style="width:110px"> Value <input id="tagValue" type="text" placeholder="例如: residential" style="width:110px"></label>
+  <button id="saveTplBtn" class="btn-primary" onclick="saveTemplate()">保存为模板</button>
+  <button id="undoTplBtn" class="btn-select" onclick="undoTemplate()">撤销上次保存</button>
+    <label style="margin-left:12px;">自动查询: <input id="autoRoute" type="checkbox"></label>
   </div>
   <div id="map"></div>
   <div class="result" id="result"></div>
@@ -92,9 +123,154 @@
     var map = L.map('map').setView([31.2304, 121.4737], 12);
     L.tileLayer('http://localhost:3000/tiles/{z}/{x}/{y}.png', {
       maxZoom: 19,
-      attribution: '© OpenStreetMap（本地离线）'
+      attribution: '© 高德地图（本地离线）'
     }).addTo(map);
-    var polyline;
+  var polyline;
+  var previewLine;
+  var selecting = 'from'; // 'from' or 'to'
+  var autoRoute = false;
+  var drawing = false;
+  var drawPoints = [];
+  var drawLayer = null;
+  var arcPreviewLayers = [];
+
+    // Toggle selection mode on double-click of map container (or add UI later)
+    // initialize selection buttons state
+    selectMode(selecting);
+
+    function selectMode(mode) {
+      var fromBtn = document.getElementById('selFromBtn');
+      var toBtn = document.getElementById('selToBtn');
+      // toggle: if clicking the already-selected mode, deselect
+      if (selecting === mode) {
+        selecting = null;
+        document.getElementById('result').innerText = '';
+      } else {
+        selecting = mode;
+      }
+      fromBtn.classList.toggle('active', selecting === 'from');
+      toBtn.classList.toggle('active', selecting === 'to');
+    }
+
+    document.getElementById('autoRoute').addEventListener('change', function(e){ autoRoute = e.target.checked; });
+
+    // show/hide template-specific inputs
+    document.getElementById('templateType').addEventListener('change', function(e) {
+      const v = e.target.value;
+      document.getElementById('arcIdsLabel').style.display = (v === 'arc_ids') ? 'inline-block' : 'none';
+      document.getElementById('tagFilterLabel').style.display = (v === 'tag_filter') ? 'inline-block' : 'none';
+    });
+
+    
+    
+
+    map.on('click', function(e) {
+      if (drawing) {
+        drawPoints.push([e.latlng.lat, e.latlng.lng]);
+        if (drawLayer) map.removeLayer(drawLayer);
+        drawLayer = L.polygon(drawPoints, {color: 'blue', dashArray: '6,6'}).addTo(map);
+        return;
+      }
+      if (!selecting) {
+        document.getElementById('result').innerText = '请先点击“选择 起点”或“选择 终点”按钮来指定目标。';
+        return;
+      }
+      // on click, call /nearest to get nearest existing node and draw preview
+      fetch(`/nearest?lat=${e.latlng.lat}&lon=${e.latlng.lng}`)
+        .then(r => r.json())
+        .then(j => {
+          if (j.error) {
+            document.getElementById('result').innerText = 'nearest 错误: ' + j.error;
+            return;
+          }
+          const nearest = [j.lat, j.lon];
+          // draw dashed preview from click to nearest
+          if (previewLine) map.removeLayer(previewLine);
+          previewLine = L.polyline([[e.latlng.lat, e.latlng.lng], nearest], {color: 'orange', dashArray: '10,10'}).addTo(map);
+          // fill the appropriate input
+          if (selecting === 'from') document.getElementById('from').value = `${nearest[0]},${nearest[1]}`;
+          else if (selecting === 'to') document.getElementById('to').value = `${nearest[0]},${nearest[1]}`;
+
+          // auto-trigger route if enabled
+          if (autoRoute) {
+            setTimeout(route, 50);
+          }
+        })
+        .catch(err => {
+          document.getElementById('result').innerText = 'nearest 请求失败: ' + err;
+        });
+    });
+
+    function toggleDrawPoly() {
+      drawing = !drawing;
+      document.getElementById('drawPolyBtn').classList.toggle('active', drawing);
+      if (!drawing && drawPoints.length >= 3) {
+        // keep polygon drawn
+      }
+    }
+
+    function previewPolygon() {
+      if (drawPoints.length < 3) { document.getElementById('result').innerText = '请绘制至少3个点的多边形作为区域。'; return; }
+      document.getElementById('result').innerText = '正在预览影响...';
+      fetch('/api/resolve_poly', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ polygon: drawPoints }) })
+        .then(r => r.json()).then(j => {
+          if (j.error) { document.getElementById('result').innerText = '预览错误: ' + j.error; return; }
+          document.getElementById('result').innerText = `影响弧数量: ${j.arc_count}`;
+          // clear old arc preview layers
+          for (const l of arcPreviewLayers) map.removeLayer(l);
+          arcPreviewLayers = [];
+          if (j.arc_coords && Array.isArray(j.arc_coords)) {
+            for (const a of j.arc_coords) {
+              const line = L.polyline([a.u, a.v], { color: 'orange', weight: 2, opacity: 0.8 }).addTo(map);
+              arcPreviewLayers.push(line);
+            }
+          }
+        }).catch(e => { document.getElementById('result').innerText = '预览失败: ' + e; });
+    }
+
+    function saveTemplate() {
+      if (drawPoints.length < 3) { document.getElementById('result').innerText = '请先绘制多边形'; return; }
+      const ttype = document.getElementById('templateType').value;
+      let tpl = { name: 'user-template', action: { forbid: true } };
+      if (ttype === 'polygon') {
+        tpl.polygon = drawPoints;
+      } else if (ttype === 'arc_ids') {
+        const raw = document.getElementById('arcIdsInput').value.trim();
+        const arr = raw ? raw.split(',').map(s=>parseInt(s.trim())).filter(n=>!Number.isNaN(n)) : [];
+        tpl.arc_ids = arr;
+      } else if (ttype === 'tag_filter') {
+        tpl.tag_filter = { key: document.getElementById('tagKey').value.trim(), value: document.getElementById('tagValue').value.trim() };
+      }
+      fetch('/api/templates', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(tpl) })
+        .then(r => r.json()).then(j => {
+          if (j.signature) {
+            document.getElementById('result').innerText = '模板已保存，签名: ' + j.signature + '。正在预计算...';
+            // trigger precompute
+            fetch(`/api/templates/${j.signature}/precompute`, { method: 'POST' }).then(r2 => r2.json()).then(pj => {
+              document.getElementById('result').innerText = `模板保存并预计算完成。影响弧: ${pj.result ? pj.result.arc_count : 'unknown'}`;
+              // store last saved signature for undo
+              window.__last_saved_template_sig = j.signature;
+            }).catch(e => { document.getElementById('result').innerText = '预计算失败: ' + e; });
+          } else {
+            document.getElementById('result').innerText = '保存模板失败: ' + JSON.stringify(j);
+          }
+        }).catch(e => { document.getElementById('result').innerText = '保存失败: ' + e; });
+    }
+
+    function undoTemplate() {
+      const sig = window.__last_saved_template_sig;
+      if (!sig) { document.getElementById('result').innerText = '没有可撤销的保存。'; return; }
+      document.getElementById('result').innerText = '正在撤销模板...';
+      // call DELETE -> moves to trash; then clear last saved
+      fetch(`/api/templates/${sig}`, { method: 'DELETE' }).then(r => r.json()).then(j => {
+        if (j.deleted) {
+          document.getElementById('result').innerText = '已撤销保存（移至回收站）: ' + sig;
+          window.__last_saved_template_sig = null;
+        } else {
+          document.getElementById('result').innerText = '撤销失败: ' + JSON.stringify(j);
+        }
+      }).catch(e => { document.getElementById('result').innerText = '撤销请求失败: ' + e; });
+    }
 
     function route() {
       var from = document.getElementById('from').value.trim();

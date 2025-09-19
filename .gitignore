@@ -20,6 +20,8 @@ data/
 tiles/
 *.pbf
 *.osm.pbf
+# Generated caches and metric binaries
+cache/
 
 # Editor/OS
 *.swp

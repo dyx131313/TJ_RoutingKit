@@ -46,6 +46,11 @@ public:
     // Checks if a metric for the given profile is already in the cache.
     bool is_metric_cached(TrafficProfile profile) const;
 
+    // Public wrapper to generate the underlying weight vector for a profile.
+    // This allows external code to obtain the arc-weight array and
+    // persist or reuse it for per-bucket metrics.
+    std::vector<unsigned> generate_weights_for_profile_for_bucket(TrafficProfile profile);
+
 private:
     // Reference to the global CCH topology
     const CustomizableContractionHierarchy& cch;
