@@ -72,3 +72,38 @@ RoutingKit 算法库支持自动化 Makefile 生成，应用层各模块独立�
 
 这些功能已在当前分支的开发环境中验证：C++ 后端可加载由 Node 生成的 `metric_sig` 文件并使查询结果发生预期变化（见项目的测试记录）。
 
+## 最近变更（近期实现的细节）
+
+下面列出最近在后端、Node 网关与前端做出的关键改动，便于开发与运维团队理解输出语义与诊断方法：
+
+- **后端：明确度量与几何距离**
+	- 路由响应现在同时返回明确的度量值与几何距离：`metric_distance`（算法权重）、`distance_meters`（基于路径节点的 Haversine 物理距离）。
+	- 当可用时还会返回 `geo_distance_arcs_meters`，通过沿查询返回的弧路径（`get_arc_path()`）对图中 `graph.geo_distance` 逐弧求和得到，更准确地反映图上弧长度。
+	- 为避免歧义，后端会返回 `metric_unit`（例如 `ms`）和 `metric_source`（如 `bucket:0`、`signature:<path>` 或 `traffic_modeler:<profile>`）来说明 `metric_distance` 的来源与单位。
+
+- **Node 网关：转发与诊断**
+	- Node (`app_node/index.js`) 保持对后端 JSON 的原样转发，但在收到包含 `metric_unit`/`metric_source` 字段时会将其记录到服务日志，便于线上诊断与审计。
+	- Node 对 `RESOLVE_POLY` 的缓存与 `metric_sig` 文件管理逻辑未变，但会优先使用磁盘缓存 `cache/<pbf-hash>/templates/resolve_poly_<hash>.json` 来避免重复解析。
+
+- **前端：单位感知的展示**
+	- 前端在显示 `metric_distance` 时会参考 `metric_unit`；当 `metric_unit == 'ms'` 时会同时显示毫秒与换算后的秒数（例如 `50400 ms (~50.40 s)`），以减少单位误读。
+	- 若 `metric_unit` 缺失，前端会给出兼容提示，提醒用户该 metric 可能是 travel_time_ms 或其它权重单位。
+
+- **实现与运行提示**
+	- 后端必须以 `--pbf <path>` 参数正确启动以载入路网与缓存。重启后若遗漏 `--pbf` 会导致服务不可用并返回错误信息（请检查 `routing_server.log`）。
+	- 在调试度量问题时，可以使用 Node 的 `INFO` 转发（`echo "INFO" | nc 127.0.0.1 12345`）来查询后端返回的 `travel_time_count` / `arc_count` 等元信息，以确保生成的 `metric_sig` 与后端一致。
+
+示例：一次典型的 `/route` 返回（已格式化）如下所示，便于前端与外部系统判断单位与来源：
+
+```
+{
+	"metric_distance": 50400,
+	"metric_source": "bucket:0",
+	"metric_unit": "ms",
+	"distance_meters": 731,
+	"path_coordinates": [ [31.230444,121.473885], ..., [31.224434,121.476852] ]
+}
+```
+
+这些变化的目标是消除度量单位与来源的歧义、提高 arc 长度计算的准确性，并给运维/开发人员更清晰的诊断线索。
+

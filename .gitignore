@@ -33,3 +33,5 @@ cache/
 # Logs and temporary files
 *.log
 tmp/
+
+cmd.sh

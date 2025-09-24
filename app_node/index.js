@@ -27,11 +27,12 @@ function handle_request(req, res) {
     const time_param = time || '';
 
     const client = new net.Socket();
-    
+
     client.connect(CPP_SERVER_PORT, CPP_SERVER_HOST, () => {
         console.log('已连接到 C++ 路由计算服务');
-        // support optional metric_sig query parameter to apply a custom metric
-        const metric_sig = req.query.metric_sig || '';
+    // support optional metric_sig query parameter to apply a custom metric
+    // also accept rule_id as a shortcut to refer to a built merged metric
+    const metric_sig = req.query.metric_sig || req.query.rule_id || '';
         let request_str = time_param ? `${from},${to},${profile_str},${time_param}` : `${from},${to},${profile_str}`;
         if (metric_sig) request_str = request_str + `,metric_sig:${metric_sig}`;
         // ensure newline termination so backend can rely on it
@@ -47,6 +48,12 @@ function handle_request(req, res) {
         if (response_buffer.includes('\n')) {
             try {
                 const json_output = JSON.parse(response_buffer);
+                // log metric unit and source for diagnostics (forwarded unchanged)
+                try {
+                    if (json_output && (json_output.metric_unit || json_output.metric_source)) {
+                        console.log('C++ route result metric_unit=', json_output.metric_unit, 'metric_source=', json_output.metric_source);
+                    }
+                } catch (e) { /* ignore logging errors */ }
                 if (json_output.error) {
                     res.status(500).json(json_output);
                 } else {
@@ -78,7 +85,30 @@ app.get('/route', (req, res) => {
     if (!from || !to) {
         return res.status(400).send('错误: "from" 和 "to" 参数是必需的。');
     }
-    
+    // if rule_id provided, ensure rule metric exists (build it) and expose as metric_sig_<id>.bin
+    const rule_id = req.query.rule_id || '';
+    if (rule_id) {
+        (async () => {
+            try {
+                // attempt to build metric for rule (if already built, buildMetricForRule will update metadata)
+                const br = await buildMetricForRule(rule_id, undefined);
+                // ensure metric_sig_<rule_id>.bin exists alongside metric_rule_<rule_id>.bin
+                const outdir = path.join(path.resolve(__dirname, '..', 'cache'), PBF_HASH);
+                const sigPath = path.join(outdir, `metric_sig_${rule_id}.bin`);
+                try {
+                    if (!fs.existsSync(sigPath)) {
+                        try { fs.linkSync(br.path, sigPath); } catch (e) { fs.copyFileSync(br.path, sigPath); }
+                    }
+                } catch (e) { console.warn('failed to create metric_sig link for rule', e); }
+            } catch (e) {
+                console.warn('route: failed to build/ensure rule metric', e.message || e);
+                // continue — route may still be computed without rule metric
+            }
+            handle_request(req, res);
+        })();
+        return;
+    }
+
     handle_request(req, res);
 });
 
@@ -150,12 +180,127 @@ function detectPbfHash() {
 const PBF_HASH = detectPbfHash();
 const CACHE_TEMPLATES_DIR = path.resolve(__dirname, `../cache/${PBF_HASH}/templates`);
 const CACHE_TEMPLATES_TRASH = path.resolve(__dirname, `../cache/${PBF_HASH}/templates/trash`);
+const CACHE_RULES_DIR = path.resolve(__dirname, `../cache/${PBF_HASH}/rules`);
 
 function ensureCacheDir() {
     try {
         fs.mkdirSync(CACHE_TEMPLATES_DIR, { recursive: true });
         fs.mkdirSync(CACHE_TEMPLATES_TRASH, { recursive: true });
+        fs.mkdirSync(CACHE_RULES_DIR, { recursive: true });
     } catch(e) {}
+}
+
+// Helpers for rules storage
+function rulePath(id) {
+    return path.join(CACHE_RULES_DIR, `rules_${id}.json`);
+}
+
+function listRuleFiles() {
+    try {
+        if (!fs.existsSync(CACHE_RULES_DIR)) return [];
+        return fs.readdirSync(CACHE_RULES_DIR).filter(f => f.startsWith('rules_') && f.endsWith('.json'));
+    } catch (e) { return []; }
+}
+
+function readRule(id) {
+    const p = rulePath(id);
+    if (!fs.existsSync(p)) return null;
+    try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch(e) { return null; }
+}
+
+function writeRule(obj) {
+    if (!obj.id) return false;
+    const p = rulePath(obj.id);
+    try { fs.writeFileSync(p, JSON.stringify(obj, null, 2)); return true; } catch(e) { console.error('writeRule failed', e); return false; }
+}
+
+function generateRuleId() {
+    return `${Date.now().toString(36)}${Math.floor(Math.random()*10000).toString(36)}`;
+}
+
+// Collect affected arcs for a list of template signatures
+function collectAffectedArcsFromTemplates(templateSigs) {
+    const set = new Set();
+    for (const sig of templateSigs) {
+        const tplPath = path.join(CACHE_TEMPLATES_DIR, `tpl_${sig}.json`);
+        if (!fs.existsSync(tplPath)) continue;
+        try {
+            const tpl = JSON.parse(fs.readFileSync(tplPath,'utf8'));
+            const arcIds = tpl.canonical && Array.isArray(tpl.canonical.arc_ids) ? tpl.canonical.arc_ids : (tpl.original && Array.isArray(tpl.original.arc_ids) ? tpl.original.arc_ids : null);
+            const poly = tpl.canonical && tpl.canonical.polygon ? tpl.canonical.polygon : (tpl.original && tpl.original.polygon ? tpl.original.polygon : null);
+            if (Array.isArray(arcIds) && arcIds.length) { for (const a of arcIds) set.add(Number(a)); continue; }
+            if (Array.isArray(poly) && poly.length>=3) {
+                const coords = poly.map(p => `${p[0].toFixed(6)},${p[1].toFixed(6)}`);
+                const canon = coords.join(';');
+                const hash = crypto.createHash('sha256').update(canon).digest('hex');
+                const cache_file = path.join(CACHE_TEMPLATES_DIR, `resolve_poly_${hash}.json`);
+                if (fs.existsSync(cache_file)) {
+                    try { const d = JSON.parse(fs.readFileSync(cache_file,'utf8')); if (Array.isArray(d.arc_ids)) { for (const a of d.arc_ids) set.add(Number(a)); }
+                    } catch(e) {}
+                }
+            }
+        } catch(e) { }
+    }
+    return Array.from(set).sort((a,b)=>a-b);
+}
+
+// Build merged metric for a rule (write metric_rule_<id>.bin)
+async function buildMetricForRule(ruleId, bigValue) {
+    const rule = readRule(ruleId);
+    if (!rule) throw new Error('rule not found');
+    const affected = collectAffectedArcsFromTemplates(rule.templates || []);
+    if (!Array.isArray(affected) || affected.length === 0) throw new Error('no affected arcs');
+
+    // determine travel_time_count from C++ INFO
+    async function queryCppInfo() {
+        return new Promise((resolve) => {
+            const client = new net.Socket();
+            let buf = '';
+            client.connect(CPP_SERVER_PORT, CPP_SERVER_HOST, () => { client.write('INFO\n'); });
+            client.on('data', (data) => {
+                buf += data.toString();
+                if (buf.includes('\n')) {
+                    try { const j = JSON.parse(buf); if (j && Number.isInteger(j.travel_time_count)) { client.end(); return resolve(j.travel_time_count); } if (j && Number.isInteger(j.arc_count)) { client.end(); return resolve(j.arc_count); } } catch(e) {}
+                    client.end(); return resolve(null);
+                }
+            });
+            client.on('error', (err) => { console.error('queryCppInfo error', err.message); resolve(null); });
+            client.on('close', () => resolve(null));
+        });
+    }
+
+    let estimated = 0;
+    try { const c = await queryCppInfo(); if (c && Number.isInteger(c)) estimated = c; } catch(e) {}
+    if (!estimated) {
+        // fallback: pick max affected + 1
+        estimated = (affected.length ? (affected[affected.length-1]+1) : 0);
+    }
+
+    const weights = new Array(estimated).fill(1000);
+    const BIG = Number.isFinite(bigValue) ? bigValue : 1000000000;
+    for (const a of affected) if (a >=0 && a < weights.length) weights[a] = BIG;
+
+    const outdir = path.join(path.resolve(__dirname, '..', 'cache'), PBF_HASH);
+    try { fs.mkdirSync(outdir, { recursive: true }); } catch(e) {}
+    const outpath = path.join(outdir, `metric_rule_${ruleId}.bin`);
+    const buf = Buffer.alloc(8 + weights.length * 4);
+    buf.writeBigUInt64LE(BigInt(weights.length), 0);
+    for (let i=0;i<weights.length;i++) buf.writeUInt32LE(weights[i], 8 + i*4);
+    fs.writeFileSync(outpath, buf);
+    // ensure a metric_sig_<ruleId>.bin peer file exists so C++ can load by signature
+    const sigPath = path.join(outdir, `metric_sig_${ruleId}.bin`);
+    try {
+        // always overwrite existing signature file to reflect latest build
+        try { if (fs.existsSync(sigPath)) fs.unlinkSync(sigPath); } catch(e) {}
+        try { fs.linkSync(outpath, sigPath); }
+        catch (e) { try { fs.copyFileSync(outpath, sigPath); } catch (e2) { console.warn('failed to create metric_sig peer file (copy failed)', e2); } }
+    } catch (e) { console.warn('failed to create metric_sig peer file', e); }
+    // update rule metadata
+    rule.metric_path = outpath;
+    rule.merged_arc_count = affected.length;
+    rule.updated_at = new Date().toISOString();
+    writeRule(rule);
+    return { path: outpath, affected_count: affected.length };
 }
 
 // Migrate legacy cache/templates files into per-pbf dir if present
@@ -276,6 +421,10 @@ app.post('/api/templates', (req, res) => {
         return res.status(500).json({ error: 'failed to save template' });
     }
 });
+
+// Preview affected arcs for a template signature.
+// Returns JSON: { arc_count: N, arc_ids: [...], arc_coords: [ { arc, u:[lat,lon], v:[lat,lon] }, ... ] }
+// Note: consolidated template preview handler is defined later in this file
 
 // Precompute template artifacts: if template has polygon, call RESOLVE_POLY and cache result
 app.post('/api/templates/:sig/precompute', (req, res) => {
@@ -434,6 +583,66 @@ app.post('/api/templates/:sig/build', async (req, res) => {
     }
 });
 
+// Rules CRUD
+app.post('/api/rules', (req, res) => {
+    ensureCacheDir();
+    const body = req.body;
+    if (!body || !Array.isArray(body.templates)) return res.status(400).json({ error: 'body must include templates: [sig,...]' });
+    const id = body.id || generateRuleId();
+    const rule = { id, name: body.name || `rule-${id}`, description: body.description || '', templates: body.templates, created_at: new Date().toISOString() };
+    if (!writeRule(rule)) return res.status(500).json({ error: 'failed to write rule' });
+    res.json(rule);
+});
+
+app.get('/api/rules', (req, res) => {
+    ensureCacheDir();
+    const files = listRuleFiles();
+    const out = [];
+    for (const f of files) {
+        try { const j = JSON.parse(fs.readFileSync(path.join(CACHE_RULES_DIR,f),'utf8')); out.push(j); } catch(e) { console.warn('bad rule file', f); }
+    }
+    res.json({ rules: out });
+});
+
+app.get('/api/rules/:id', (req, res) => {
+    ensureCacheDir();
+    const id = req.params.id;
+    const r = readRule(id);
+    if (!r) return res.status(404).json({ error: 'not found' });
+    res.json(r);
+});
+
+app.put('/api/rules/:id', (req, res) => {
+    ensureCacheDir();
+    const id = req.params.id; const body = req.body;
+    const r = readRule(id);
+    if (!r) return res.status(404).json({ error: 'not found' });
+    r.name = body.name || r.name; r.description = body.description || r.description; r.templates = Array.isArray(body.templates) ? body.templates : r.templates; r.updated_at = new Date().toISOString();
+    if (!writeRule(r)) return res.status(500).json({ error: 'failed to write' });
+    res.json(r);
+});
+
+app.delete('/api/rules/:id', (req, res) => {
+    ensureCacheDir();
+    const id = req.params.id; const p = rulePath(id);
+    if (!fs.existsSync(p)) return res.status(404).json({ error: 'not found' });
+    try { fs.unlinkSync(p); res.json({ deleted: true, id }); } catch(e) { res.status(500).json({ error: 'failed to delete' }); }
+});
+
+// Build merged metric for a rule
+app.post('/api/rules/:id/build', async (req, res) => {
+    const id = req.params.id; const body = req.body || {};
+    const big = (body && Number(body.big)) ? Number(body.big) : undefined;
+    try {
+        const r = readRule(id); if (!r) return res.status(404).json({ error: 'not found' });
+        const result = await buildMetricForRule(id, big);
+        res.json({ built: true, path: result.path, affected_count: result.affected_count });
+    } catch (e) {
+        console.error('rule build error', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/templates', (req, res) => {
     ensureCacheDir();
     try {
@@ -445,21 +654,48 @@ app.get('/api/templates', (req, res) => {
                 const p = path.join(CACHE_TEMPLATES_DIR, f);
                 try {
                     const j = JSON.parse(fs.readFileSync(p,'utf8'));
-                    out.push({ signature: j.signature, created_at: j.created_at || fs.statSync(p).ctime.toISOString(), path: p, deleted: false });
+                    const stat = fs.statSync(p);
+                    const created = j.created_at || stat.ctime.toISOString();
+                    const created_human = new Date(created).toLocaleString();
+                    const display = j.name || (j.canonical && j.canonical.name) || (j.original && j.original.name) || j.signature;
+                    out.push({
+                        signature: j.signature,
+                        display_name: display,
+                        description: j.description || (j.canonical && j.canonical.description) || '',
+                        created_at: created,
+                        created_at_human: created_human,
+                        path: p,
+                        deleted: false,
+                        precomputed: !!(j.canonical && (Array.isArray(j.canonical.arc_ids) || Array.isArray(j.canonical.arc_coords)))
+                    });
                 } catch (e) {
                     console.warn('failed to read template', p, e.message);
                 }
             }
         }
-        // trashed templates
-        if (fs.existsSync(CACHE_TEMPLATES_TRASH)) {
+        // trashed templates: only include if caller explicitly asked with ?include_deleted=true
+        const includeDeleted = String(req.query.include_deleted || '').toLowerCase() === 'true';
+        if (includeDeleted && fs.existsSync(CACHE_TEMPLATES_TRASH)) {
             const tfiles = fs.readdirSync(CACHE_TEMPLATES_TRASH).filter(f => f.startsWith('tpl_') && f.endsWith('.json'));
             for (const f of tfiles) {
                 const p = path.join(CACHE_TEMPLATES_TRASH, f);
                 try {
                     const j = JSON.parse(fs.readFileSync(p,'utf8'));
                     const stat = fs.statSync(p);
-                    out.push({ signature: j.signature, created_at: j.created_at || stat.ctime.toISOString(), path: p, deleted: true, deleted_at: stat.ctime.toISOString() });
+                    const created = j.created_at || stat.ctime.toISOString();
+                    const deleted_at = stat.ctime.toISOString();
+                    out.push({
+                        signature: j.signature,
+                        display_name: j.name || (j.canonical && j.canonical.name) || j.signature,
+                        description: j.description || '',
+                        created_at: created,
+                        created_at_human: new Date(created).toLocaleString(),
+                        path: p,
+                        deleted: true,
+                        deleted_at: deleted_at,
+                        deleted_at_human: new Date(deleted_at).toLocaleString(),
+                        precomputed: !!(j.canonical && (Array.isArray(j.canonical.arc_ids) || Array.isArray(j.canonical.arc_coords)))
+                    });
                 } catch (e) {
                     console.warn('failed to read trash template', p, e.message);
                 }
@@ -469,6 +705,62 @@ app.get('/api/templates', (req, res) => {
     } catch (e) {
         console.error('Failed to list templates', e);
         res.status(500).json({ error: 'failed to list templates' });
+    }
+});
+
+// Preview a specific template: returns polygon, bbox and resolve preview (arc_ids or arc_coords)
+app.get('/api/templates/:sig/preview', (req, res) => {
+    ensureCacheDir();
+    const sig = req.params.sig;
+    const pathp = path.join(CACHE_TEMPLATES_DIR, `tpl_${sig}.json`);
+    if (!fs.existsSync(pathp)) return res.status(404).json({ error: 'not found' });
+    let tpl;
+    try { tpl = JSON.parse(fs.readFileSync(pathp,'utf8')); } catch (e) { return res.status(500).json({ error: 'failed to read template' }); }
+
+    // Extract polygon if present
+    const poly = tpl.canonical && tpl.canonical.polygon ? tpl.canonical.polygon : (tpl.original && tpl.original.polygon ? tpl.original.polygon : null);
+    const arcIds = tpl.canonical && Array.isArray(tpl.canonical.arc_ids) ? tpl.canonical.arc_ids : (tpl.original && Array.isArray(tpl.original.arc_ids) ? tpl.original.arc_ids : null);
+
+    const result = { signature: sig, polygon: poly || null, arc_ids: arcIds || null, precomputed: false, preview: null };
+
+    // compute bbox for polygon
+    if (Array.isArray(poly) && poly.length > 0) {
+        let minlat = 1e9, minlon = 1e9, maxlat = -1e9, maxlon = -1e9;
+        for (const p of poly) {
+            const lat = Number(p[0]), lon = Number(p[1]);
+            minlat = Math.min(minlat, lat); minlon = Math.min(minlon, lon);
+            maxlat = Math.max(maxlat, lat); maxlon = Math.max(maxlon, lon);
+        }
+        result.bbox = [minlat, minlon, maxlat, maxlon];
+    }
+
+    // try to find resolve cache
+    try {
+        if (Array.isArray(poly) && poly.length >= 3) {
+            const coords = poly.map(p => `${p[0].toFixed(6)},${p[1].toFixed(6)}`);
+            const canon = coords.join(';');
+            const hash = crypto.createHash('sha256').update(canon).digest('hex');
+            const cache_file = path.join(CACHE_TEMPLATES_DIR, `resolve_poly_${hash}.json`);
+            if (fs.existsSync(cache_file)) {
+                const d = JSON.parse(fs.readFileSync(cache_file,'utf8'));
+                result.precomputed = true;
+                // prefer arc_coords preview if present, else arc_ids
+                if (Array.isArray(d.arc_coords) && d.arc_coords.length > 0) result.preview = { arc_coords: d.arc_coords.slice(0, 200) };
+                else if (Array.isArray(d.arc_ids)) result.preview = { arc_ids: d.arc_ids.slice(0, 500) };
+                return res.json(result);
+            }
+        }
+        // fallback: if arc_ids present in template, return summary
+        if (Array.isArray(arcIds) && arcIds.length > 0) {
+            result.precomputed = true;
+            result.preview = { arc_ids: arcIds.slice(0, 500) };
+            return res.json(result);
+        }
+        // as last fallback return polygon only
+        res.json(result);
+    } catch (e) {
+        console.error('template preview error', e);
+        res.status(500).json({ error: 'failed to prepare preview' });
     }
 });
 

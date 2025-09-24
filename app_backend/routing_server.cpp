@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <cstring>
 #include <cmath>
+#include <dirent.h>
 
 // Global configuration
 int GLOBAL_BUCKET_MINUTES = 30;
@@ -155,22 +156,69 @@ void perform_routing(
     if (source_node == RoutingKit::invalid_id || target_node == RoutingKit::invalid_id) {
         response_json = "{\"error\":\"无法在5公里半径内找到起点或终点。\"}";
     } else {
-        const RoutingKit::CustomizableContractionHierarchyMetric* metric = nullptr;
+    const RoutingKit::CustomizableContractionHierarchyMetric* metric = nullptr;
+    std::string metric_source = "unknown";
+    int chosen_bucket_index = -1;
         // If a metric signature is provided, try to load metric weights from cache and construct a metric
-        std::unique_ptr<RoutingKit::CustomizableContractionHierarchyMetric> metric_local_owner;
+    std::unique_ptr<RoutingKit::CustomizableContractionHierarchyMetric> metric_local_owner;
+    std::unique_ptr<std::vector<unsigned>> metric_weights_local;
         if (!metric_sig.empty()) {
             try {
-                std::string metric_path = routing_data_ptr->cache_base + "/metric_sig_" + metric_sig + ".bin";
-                std::vector<unsigned> weights;
-                if (read_vector_bin(metric_path, weights)) {
-                    if (weights.size() == routing_data_ptr->graph.travel_time.size()) {
-                        metric_local_owner = std::make_unique<RoutingKit::CustomizableContractionHierarchyMetric>(*routing_data_ptr->cch, weights);
-                        metric_local_owner->customize();
-                        metric = metric_local_owner.get();
-                        std::cout << "Loaded metric from signature file: " << metric_path << std::endl;
-                    } else {
-                        std::cerr << "Metric signature file weights size mismatch: " << metric_path << " (" << weights.size() << " vs " << routing_data_ptr->graph.travel_time.size() << ")" << std::endl;
+                std::vector<std::string> candidates;
+                // primary candidate: configured cache_base
+                if (!routing_data_ptr->cache_base.empty()) candidates.push_back(routing_data_ptr->cache_base + "/metric_sig_" + metric_sig + ".bin");
+                // also try a direct name in CWD (maintain backward compatibility)
+                candidates.push_back(std::string("./metric_sig_") + metric_sig + ".bin");
+                // search under ./cache/* for metric_sig_<id>.bin
+                const char *cache_root = "./cache";
+                DIR *d = opendir(cache_root);
+                if (d) {
+                    struct dirent *ent;
+                    while ((ent = readdir(d)) != nullptr) {
+                        if (ent->d_type == DT_DIR) {
+                            std::string name = ent->d_name;
+                            if (name == "." || name == "..") continue;
+                            std::string p = std::string(cache_root) + "/" + name + "/metric_sig_" + metric_sig + ".bin";
+                            candidates.push_back(p);
+                        }
                     }
+                    closedir(d);
+                }
+
+                bool loaded_ok = false;
+                for (const auto &metric_path : candidates) {
+                    std::vector<unsigned> weights;
+                    std::cout << "Attempting to load metric signature from: " << metric_path << std::endl;
+                    // attempt to read header first to log count if file exists
+                    std::ifstream fh(metric_path, std::ios::binary);
+                    if (fh) {
+                        uint64_t n = 0;
+                        fh.read(reinterpret_cast<char*>(&n), sizeof(n));
+                        if (fh) {
+                            std::cout << "Metric file header (N) reported: " << n << " for file: " << metric_path << std::endl;
+                        }
+                        fh.close();
+                    }
+                    if (read_vector_bin(metric_path, weights)) {
+                        std::cout << "Read metric file '" << metric_path << "' with weights count=" << weights.size() << std::endl;
+                        if (weights.size() == routing_data_ptr->graph.travel_time.size()) {
+                        metric_weights_local = std::make_unique<std::vector<unsigned>>(std::move(weights));
+                        metric_local_owner = std::make_unique<RoutingKit::CustomizableContractionHierarchyMetric>(*routing_data_ptr->cch, *metric_weights_local);
+                            metric_local_owner->customize();
+                            metric = metric_local_owner.get();
+                            metric_source = std::string("signature:") + metric_path;
+                            std::cout << "Loaded metric from signature file: " << metric_path << std::endl;
+                            loaded_ok = true;
+                            break;
+                        } else {
+                            std::cerr << "Metric signature file weights size mismatch: " << metric_path << " (" << weights.size() << " vs " << routing_data_ptr->graph.travel_time.size() << ")" << std::endl;
+                        }
+                    } else {
+                        std::cerr << "Failed to read metric signature file: " << metric_path << std::endl;
+                    }
+                }
+                if (!loaded_ok) {
+                    std::cerr << "No usable metric signature found for id: " << metric_sig << std::endl;
                 }
             } catch (const std::exception &e) {
                 std::cerr << "Failed loading metric_sig file: " << e.what() << std::endl;
@@ -179,8 +227,10 @@ void perform_routing(
         if (!metric) {
             if (profile_str == "morning_peak") {
                 metric = &routing_data_ptr->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::MORNING_PEAK);
+                metric_source = "traffic_modeler:morning_peak";
             } else if (profile_str == "evening_peak") {
                 metric = &routing_data_ptr->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::EVENING_PEAK);
+                metric_source = "traffic_modeler:evening_peak";
             } else {
                 // if bucketed metrics are available and query_time_sec provided, pick bucket
                 auto rd_ptr = routing_data_ptr; // convenience
@@ -193,10 +243,14 @@ void perform_routing(
                     const RoutingKit::CustomizableContractionHierarchyMetric* loaded = ensure_bucket_metric_loaded(*rd_ptr, rd_ptr->cache_base, bucket_index, minutes);
                     if (loaded) {
                         metric = loaded;
+                        chosen_bucket_index = bucket_index;
+                        metric_source = std::string("bucket:") + std::to_string(bucket_index);
                     }
                 }
                 if (!metric) {
                     metric = &routing_data_ptr->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::NORMAL);
+                    // Only set metric_source to NORMAL if it wasn't set by bucket selection
+                    if (metric_source == "unknown") metric_source = "traffic_modeler:normal";
                 }
             }
         }
@@ -206,15 +260,55 @@ void perform_routing(
         query.reset().add_source(source_node).add_target(target_node).run();
         std::cout << "[Thread " << std::this_thread::get_id() << "] CCH query finished." << std::endl;
         
-        unsigned distance = query.get_distance();
+    unsigned distance = query.get_distance();
 
-        std::cout << "[Thread " << std::this_thread::get_id() << "] Got distance: " << distance << std::endl;
+    std::cout << "[Thread " << std::this_thread::get_id() << "] Got distance: " << distance << std::endl;
 
         std::vector<unsigned> path_nodes = query.get_node_path();
         
         std::cout << "[Thread " << std::this_thread::get_id() << "] Got path with " << path_nodes.size() << " nodes." << std::endl;
 
         if (distance == RoutingKit::inf_weight) {
+            // Diagnostic: if a custom metric was used and we got no path, check connectivity
+            if (!metric_sig.empty() && metric_local_owner) {
+                try {
+                    if (!metric_weights_local) {
+                        std::cerr << "Diagnostic: no metric_weights_local available for metric_sig=" << metric_sig << std::endl;
+                        throw std::runtime_error("no metric weights available");
+                    }
+                    const std::vector<unsigned> &w = *metric_weights_local;
+                    unsigned long big_count = 0;
+                    unsigned long allowed_count = 0;
+                    unsigned threshold = 100000; // consider weights >= threshold as blocked
+                    for (size_t i = 0; i < w.size(); ++i) {
+                        if (w[i] >= threshold) big_count++;
+                        else allowed_count++;
+                    }
+                    std::cout << "[Thread " << std::this_thread::get_id() << "] Diagnostic: metric_sig='" << metric_sig << "' big_count=" << big_count << " allowed_count=" << allowed_count << std::endl;
+                    // quick BFS from source to target using allowed arcs only
+                    std::vector<char> vis(routing_data_ptr->graph.node_count, 0);
+                    std::vector<unsigned> q;
+                    q.reserve(1024);
+                    q.push_back(source_node);
+                    vis[source_node] = 1;
+                    size_t qi = 0;
+                    bool reachable = false;
+                    while (qi < q.size()) {
+                        unsigned u = q[qi++];
+                        if (u == target_node) { reachable = true; break; }
+                        unsigned start = routing_data_ptr->graph.first_out[u];
+                        unsigned end = (u+1 < routing_data_ptr->graph.first_out.size()) ? routing_data_ptr->graph.first_out[u+1] : routing_data_ptr->graph.arc_count;
+                        for (unsigned e = start; e < end; ++e) {
+                            if (w[e] >= threshold) continue; // blocked
+                            unsigned v = routing_data_ptr->graph.head[e];
+                            if (!vis[v]) { vis[v]=1; q.push_back(v); }
+                        }
+                    }
+                    std::cout << "[Thread " << std::this_thread::get_id() << "] Diagnostic: reachable_with_allowed_arcs=" << (reachable?"yes":"no") << std::endl;
+                } catch (const std::exception &e) {
+                    std::cerr << "Diagnostic check failed: " << e.what() << std::endl;
+                }
+            }
             response_json = "{\"error\":\"在所选交通模式下找不到路径。\"}";
         } else {
             std::string path_json = "[";
@@ -228,8 +322,76 @@ void perform_routing(
             }
             path_json += "]";
 
+            // compute geographic length (meters) from node coordinates as a more accurate physical distance
+            auto deg2rad = [](double deg){ return deg * M_PI / 180.0; };
+            double geo_len_m = 0.0;
+            if (path_nodes.size() >= 2) {
+                for (size_t i = 1; i < path_nodes.size(); ++i) {
+                    unsigned a = path_nodes[i-1];
+                    unsigned b = path_nodes[i];
+                    double lat1 = routing_data_ptr->graph.latitude[a];
+                    double lon1 = routing_data_ptr->graph.longitude[a];
+                    double lat2 = routing_data_ptr->graph.latitude[b];
+                    double lon2 = routing_data_ptr->graph.longitude[b];
+                    double dlat = deg2rad(lat2 - lat1);
+                    double dlon = deg2rad(lon2 - lon1);
+                    double rlat1 = deg2rad(lat1);
+                    double rlat2 = deg2rad(lat2);
+                    double sin_dlat = std::sin(dlat/2.0);
+                    double sin_dlon = std::sin(dlon/2.0);
+                    double a_hav = sin_dlat*sin_dlat + std::cos(rlat1)*std::cos(rlat2)*sin_dlon*sin_dlon;
+                    double c = 2.0 * std::atan2(std::sqrt(a_hav), std::sqrt(std::max(0.0, 1.0 - a_hav)));
+                    const double R = 6371000.0; // earth radius in meters
+                    geo_len_m += R * c;
+                }
+            }
+
+            unsigned long geo_len_round = static_cast<unsigned long>(std::llround(geo_len_m));
+            // compute arc-based geo_distance sum if graph.geo_distance is available
+            unsigned long geo_arc_sum = 0;
+            bool have_geo_arc = false;
+            if (path_nodes.size() >= 2 && routing_data_ptr->graph.geo_distance.size() > 0) {
+                // prefer using the arc path returned by the CCH query when available
+                std::vector<unsigned> arc_path = query.get_arc_path();
+                if (!arc_path.empty()) {
+                    have_geo_arc = true;
+                    for (unsigned a : arc_path) {
+                        if (a < routing_data_ptr->graph.geo_distance.size()) geo_arc_sum += routing_data_ptr->graph.geo_distance[a];
+                        else { have_geo_arc = false; break; }
+                    }
+                } else {
+                    // fallback: map consecutive node pairs to outgoing arcs (older approach)
+                    have_geo_arc = true;
+                    for (size_t i = 1; i < path_nodes.size(); ++i) {
+                        unsigned u = path_nodes[i-1];
+                        unsigned v = path_nodes[i];
+                        unsigned start = routing_data_ptr->graph.first_out[u];
+                        unsigned end = (u+1 < routing_data_ptr->graph.first_out.size()) ? routing_data_ptr->graph.first_out[u+1] : routing_data_ptr->graph.arc_count;
+                        bool found = false;
+                        for (unsigned a = start; a < end; ++a) {
+                            if (routing_data_ptr->graph.head[a] == v) {
+                                if (a < routing_data_ptr->graph.geo_distance.size()) {
+                                    geo_arc_sum += routing_data_ptr->graph.geo_distance[a];
+                                }
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) { have_geo_arc = false; break; }
+                    }
+                }
+            }
+
             response_json = "{";
-            response_json += "\"distance_meters\": " + std::to_string(distance) + ",";
+            // original `distance` is the sum of metric weights (may represent travel_time/ms or other units)
+            response_json += "\"metric_distance\": " + std::to_string(distance) + ",";
+            // return metric_source and metric_unit to avoid ambiguity
+            response_json += "\"metric_source\": \"" + metric_source + "\",";
+            std::string metric_unit = "unknown";
+            if (routing_data_ptr->graph.travel_time.size() == routing_data_ptr->graph.geo_distance.size()) metric_unit = "ms";
+            response_json += "\"metric_unit\": \"" + metric_unit + "\",";
+            response_json += "\"distance_meters\": " + std::to_string(geo_len_round) + ",";
+            if (have_geo_arc) response_json += "\"geo_distance_arcs_meters\": " + std::to_string(geo_arc_sum) + ",";
             response_json += "\"path_coordinates\": " + path_json;
             response_json += "}";
         }
@@ -525,7 +687,8 @@ void handle_connection(int client_socket, std::shared_ptr<RoutingData> routing_d
               params.push_back(segment);
         }
 
-        // extract possible metric_sig parameter from params (formats: "metric_sig:HEX" or "metric_sig=HEX" or ["metric_sig", "HEX"])
+        // extract possible metric_sig parameter from params (formats: "metric_sig:HEX" or "metric_sig=HEX" or ["metric_sig", "HEX"]).
+        // Normalize/truncate the extracted value to be robust against clients that already include a "metric_sig_" prefix
         std::string extracted_metric_sig;
         for (size_t pi = 0; pi < params.size(); ++pi) {
             const std::string &p = params[pi];
@@ -541,6 +704,26 @@ void handle_connection(int client_socket, std::shared_ptr<RoutingData> routing_d
                 extracted_metric_sig = params[pi+1];
                 break;
             }
+        }
+
+        // sanitize extracted_metric_sig: trim whitespace and remove stray control chars
+        if (!extracted_metric_sig.empty()) {
+            // trim front
+            while (!extracted_metric_sig.empty() && isspace((unsigned char)extracted_metric_sig.front())) extracted_metric_sig.erase(0,1);
+            // trim back
+            while (!extracted_metric_sig.empty() && isspace((unsigned char)extracted_metric_sig.back())) extracted_metric_sig.pop_back();
+            // remove any embedded CR/LF that somehow survived
+            extracted_metric_sig.erase(std::remove(extracted_metric_sig.begin(), extracted_metric_sig.end(), '\n'), extracted_metric_sig.end());
+            extracted_metric_sig.erase(std::remove(extracted_metric_sig.begin(), extracted_metric_sig.end(), '\r'), extracted_metric_sig.end());
+            // if the client already provided a name that includes the 'metric_sig_' prefix, strip it so later path construction is consistent
+            const std::string prefix = "metric_sig_";
+            if (extracted_metric_sig.rfind(prefix, 0) == 0) {
+                extracted_metric_sig = extracted_metric_sig.substr(prefix.size());
+            }
+            // additional safety: if value accidentally contains a leading 'metric_sig:' or 'metric_sig=' remove it
+            if (extracted_metric_sig.rfind("metric_sig:", 0) == 0) extracted_metric_sig = extracted_metric_sig.substr(strlen("metric_sig:"));
+            if (extracted_metric_sig.rfind("metric_sig=", 0) == 0) extracted_metric_sig = extracted_metric_sig.substr(strlen("metric_sig="));
+            std::cout << "[Thread " << std::this_thread::get_id() << "] Sanitized metric_sig: '" << extracted_metric_sig << "'" << std::endl;
         }
 
         // Special-case: NEAREST,lat,lon  -> return nearest node coordinates
