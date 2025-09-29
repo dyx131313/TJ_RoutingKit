@@ -2,18 +2,42 @@
 var arcPreviewLayers = window.arcPreviewLayers || [];
 
 async function listRules() {
-  const el = document.getElementById('rulesList');
-  if (!el) return;
+  const el = document.getElementById('rulesPanelList');
+  const selectEl = document.getElementById('ruleSelect');
+  if (!el) {
+    console.warn('rulesPanelList element not found');
+    return;
+  }
+  if (!selectEl) {
+    console.warn('ruleSelect element not found');
+    return;
+  }
   el.innerText = '加载中...';
+  selectEl.innerHTML = '<option value="">(无)</option>'; // 清空下拉框
   try {
+    console.log('Fetching rules from /api/rules');
     const j = await apiGet('/api/rules');
-    if (j.error) { el.innerText = '加载失败: ' + j.error; return; }
-    const rows = (j.rules || []).map(r=>{
-      return `<div style="border-bottom:1px solid #eee;padding:6px"><div><strong>${r.name}</strong> <small style=\"color:#666\">(${r.id})</small></div><div style=\"font-size:0.9em;color:#666\">模板: ${ (r.templates || []).slice(0,5).join(',') }${(r.templates||[]).length>5? '...':''}</div><div style=\"margin-top:6px\"><button onclick=\"buildRule('${r.id}')\" class=\"btn-select\">构建 metric</button> <button onclick=\"deleteRule('${r.id}')\" class=\"btn-select\">删除规则</button></div></div>`;
+    console.log('Received response from /api/rules:', j);
+    if (j.error) {
+      console.error('Error fetching rules:', j.error);
+      el.innerText = '加载失败: ' + j.error;
+      return;
+    }
+    const rows = (j.rules || []).map(r => {
+      console.log('Processing rule:', r);
+      return `<div style="border-bottom:1px solid #eee;padding:6px"><div><strong>${r.name}</strong> <small style="color:#666">(${r.id})</small></div><div style="font-size:0.9em;color:#666">模板: ${ (r.templates || []).slice(0,5).join(',') }${(r.templates||[]).length>5? '...':''}</div><div style="margin-top:6px"><button onclick="buildRule('${r.id}')" class="btn-select">构建 metric</button> <button onclick="deleteRule('${r.id}')" class="btn-select">删除规则</button></div></div>`;
     }).join('');
     el.innerHTML = rows || '(无)';
+
+    // 更新 ruleSelect 下拉框
+    const options = (j.rules || []).map(r => {
+      return `<option value="${r.id}">${r.name}</option>`;
+    }).join('');
+    selectEl.innerHTML = '<option value="">(无)</option>' + options; // 始终保留“无规则”选项
   } catch (e) {
+    console.error('Error in listRules:', e);
     el.innerText = '加载失败: ' + e;
+    selectEl.innerHTML = '<option value="">(加载失败)</option>';
   }
 }
 
@@ -81,3 +105,12 @@ window.listRules = listRules;
 window.buildRule = buildRule;
 window.deleteRule = deleteRule;
 window.previewRule = previewRule;
+
+// Ensure listRules is called on script load
+window.addEventListener('DOMContentLoaded', () => {
+  try {
+    listRules();
+  } catch (e) {
+    console.error('Error initializing rules on page load:', e);
+  }
+});
