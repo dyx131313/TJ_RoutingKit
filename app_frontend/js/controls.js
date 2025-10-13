@@ -182,21 +182,16 @@ async function previewPolygon() {
     // draw polygon outline
     try { const poly = L.polygon(drawPoints, { color: 'blue', dashArray: '6,6', weight:1.5, opacity:0.9 }).addTo(map); polygonPreviewLayers.push(poly); } catch(e){}
     // draw arcs if available
-    let MAX_DRAW = 3000;
-    try { const v = parseInt(document.getElementById('previewMaxDraw').value); if (!Number.isNaN(v) && v>0) MAX_DRAW = v; } catch(e){}
-    let drawn = 0;
     if (coords && coords.length) {
       for (const a of coords) {
-        if (drawn >= MAX_DRAW) break;
         try {
           const line = L.polyline([a.u, a.v], { color: 'blue', weight: 2, opacity: 0.9 }).addTo(map);
           arcPreviewLayers.push(line);
-          drawn++;
         } catch(e){}
       }
     }
     if (arcPreviewLayers.length) { try { const group = L.featureGroup(arcPreviewLayers); map.fitBounds(group.getBounds()); } catch(e){}; try { document.getElementById('previewLegend').style.display = 'block'; } catch(e){} }
-    document.getElementById('result').innerText = `多边形解析完成，绘制 ${arcPreviewLayers.length} 条弧（展示上限 ${MAX_DRAW}）`;
+    document.getElementById('result').innerText = `多边形解析完成，绘制 ${arcPreviewLayers.length} 条弧`;
   } catch(e) {
     document.getElementById('result').innerText = '解析多边形失败: ' + e;
   }

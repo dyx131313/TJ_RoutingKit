@@ -67,17 +67,15 @@ cp /path/to/shanghai-250916.osm.pbf data/
 # 在 app_backend 下启动，监听默认 TCP 12345
 ./routing_server --pbf ../data/shanghai-250916.osm.pbf --bucket-minutes 30 --buckets 3 &> routing_server.log &
 tail -f routing_server.log
+```
 
 ## Recent Changes (short)
 
-Recent updates clarify metric semantics and improve diagnostics:
-- Backend now returns explicit `metric_unit` and `metric_source` in route JSON responses to avoid ambiguity between geometric distance and metric weight.
-- Backend computes both `distance_meters` (Haversine over node coordinates) and, when available, `geo_distance_arcs_meters` by summing `graph.geo_distance` along the arc path returned by the query.
-- Node gateway (`app_node/index.js`) logs `metric_unit`/`metric_source` and forwards backend JSON unchanged.
-- Frontend (`app_frontend/js/controls.js`) displays `metric_distance` with unit-aware formatting (e.g. shows ms and converted seconds when `metric_unit` is `ms`).
-
-See `doc/metric-units.md` for detailed explanation and verification commands.
-```
+最近更新聚焦于度量语义明确化、预览影响的完整展示与稳定性：
+- 路由响应新增并统一了 `metric_unit` 与 `metric_source` 字段，避免将“几何距离”与“度量权重”混淆；同时返回更贴近物理距离的 `distance_meters`，以及（可用时）沿弧累加的 `geo_distance_arcs_meters`。
+- 预览影响（模板/多边形）端到端移除了“最多 500 条弧”的上限，前端会绘制所有受影响弧。
+- C++ 后端 RESOLVE_POLY 修复了个别场景下的“飞线”问题，并新增受影响弧数量日志，便于核对。
+- 新增“预览判定策略”并在结果 JSON 中返回 `policy` 字段；Node 在读取旧缓存且策略不匹配时会自动重算并更新缓存。
 
 7) 启动 Node.js 网关
 
@@ -173,3 +171,94 @@ RoutingKit 原生文档与学术引用见 docs/ 与下方链接：
 * [Converting Coordinates to Node ID](doc/CoordinatesToNodeID.md)
 
 如用于学术发表，请引用 RoutingKit 相关论文。
+
+---
+
+## 预览影响（Polygon / Template）
+
+本项目支持在前端绘制多边形并“预览影响”的弧段，或对已保存的模板进行预览。
+
+- 判定策略（policy）：自 2025-10 起，RESOLVE_POLY 采用 `both_inside` 策略，即“仅当一条弧的两个端点都位于多边形内部时，该弧计为受影响”。
+	- 后端响应示例（字段节选）：
+		```json
+		{ "policy": "both_inside", "arc_count": 14364, "arc_ids": [...], "arc_coords": [{"arc":123,"u":[lat,lon],"v":[lat,lon]} ...] }
+		```
+	- Node 网关在读取历史缓存时，如发现无 `policy` 或策略不为 `both_inside`，会自动请求后端重算并覆盖旧缓存。
+
+- 缓存位置：`cache/<pbf-hash>/templates/resolve_poly_<sha256>.json`
+	- Key 由多边形坐标（6 位小数）规范化后按顺序拼接并取 SHA-256 生成。
+	- 如需手工清理缓存（例如切换策略后希望强制全量重算）：
+		```bash
+		rm -f cache/*/templates/resolve_poly_*.json
+		```
+
+- 前端交互要点：
+	- “绘制 多边形”→“预览影响”→地图上以蓝色线段高亮所有受影响弧；
+	- “取消绘制”会清理当前多边形以及各类预览图层；
+	- 模板与规则面板已拆分为左右两侧互不遮挡，模板可一键预览/关闭。
+
+## API 速览（Node 网关）
+
+- 路由：`GET /route?from=lat,lon&to=lat,lon[&profile=normal|morning_peak|evening_peak][&metric_sig=<sig>|&rule_id=<id>]`
+	- 透传到 C++ 服务，返回 JSON 包含 `metric_unit`, `metric_source`, `distance_meters`, `geo_distance_arcs_meters`（可用时）等。
+
+- 最近点：`GET /nearest?lat=..&lon=..`
+
+- 解析多边形预览：`POST /api/resolve_poly`
+	- Body: `{ "polygon": [[lat,lon], [lat,lon], ...] }`
+	- 返回含 `policy`, `arc_count`, `arc_ids`, `arc_coords`；带缓存（策略不匹配或历史截断会自动重算）。
+
+- 模板：
+	- `POST /api/templates` 保存模板（支持 `polygon` 或 `arc_ids` 或 `tag_filter`）
+	- `GET /api/templates` 列表；`GET /api/templates/:sig` 详情
+	- `GET /api/templates/:sig/preview` 预览（同样带缓存与自动重算）
+	- `POST /api/templates/:sig/precompute` 对包含多边形/弧 ID 的模板预先解析
+	- `POST /api/templates/:sig/build` 生成 `metric_sig_<sig>.bin`（用于查询的自定义度量）
+	- `DELETE /api/templates/:sig` 移入回收站；`POST /api/templates/:sig/restore` 还原
+
+- 规则：
+	- `POST /api/rules` 创建规则（选择多个模板合并）
+	- `GET /api/rules` / `GET /api/rules/:id` / `PUT /api/rules/:id` / `DELETE /api/rules/:id`
+	- `POST /api/rules/:id/build` 为规则构建并导出合并度量文件（同时提供 `metric_sig` 别名）
+
+## 调试与日志
+
+- C++ 后端：
+	- `INFO`：`echo "INFO" | nc 127.0.0.1 12345`
+	- RESOLVE_POLY 在终端输出受影响弧数量日志：`RESOLVE_POLY affected_arcs count = N`
+	- 若需核对“飞线/视角拉远”问题，优先确认后端版本包含 `both_inside` 策略与哨兵友好的 `first_out` 映射修复。
+
+- Node 网关：
+	- 对 route 结果会记录 `metric_unit` 与 `metric_source`；
+	- 对 resolve_poly 遇到策略不匹配或历史截断会自动重算并覆盖缓存。
+
+## 常见问题（Troubleshooting）
+
+- 预览只显示 500 条弧：
+	- 现版本已移除所有层面的 500 上限。如仍出现，多半是历史缓存命中；清理 `cache/*/templates/resolve_poly_*.json` 或等待 Node 自动重算（策略不匹配/截断会触发）。
+
+- 预览出现两条很长的“飞线”：
+	- 旧版本在弧索引 → 起点节点映射上存在边界处理问题；升级后端并重启，清理历史缓存后重试。
+
+- Node 提示 C++ 不可达：
+	- 检查 C++ 进程是否运行、是否监听 12345；确认 `cmd.sh`/`run.sh` 启动参数与 PBF 路径正确。
+
+- metric 权重数量不匹配：
+	- 使用 `INFO` 获取 `travel_time_count`，确认生成的 metric 长度一致；若不一致，重新生成度量文件。
+
+## 开发提示
+
+- 快速重编译 C++ 后端：
+	```bash
+	cd app_backend && make -j$(nproc)
+	```
+- 清理并重启后端（示例）：
+	```bash
+	pkill -f routing_server || true
+	./app_backend/routing_server --pbf ./data/shanghai-250916.osm.pbf --bucket-minutes 30 --buckets 3 &> routing_server.log &
+	tail -f routing_server.log
+	```
+- 清理预览缓存：
+	```bash
+	rm -f cache/*/templates/resolve_poly_*.json
+	```

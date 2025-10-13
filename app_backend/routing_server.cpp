@@ -844,34 +844,41 @@ void handle_connection(int client_socket, std::shared_ptr<RoutingData> routing_d
                                 if (std::max(ulon, vlon) < minlon) continue;
                                 if (std::min(ulon, vlon) > maxlon) continue;
 
-                                bool hit = false;
-                                if (point_in_polygon(poly, ulat, ulon) || point_in_polygon(poly, vlat, vlon)) hit = true;
-                                else if (segment_intersects_polygon(poly, ulat, ulon, vlat, vlon)) hit = true;
-
-                                if (hit) affected_arcs.push_back(a);
+                                // New policy: an arc is affected ONLY if BOTH endpoints are inside polygon
+                                bool inside_u = point_in_polygon(poly, ulat, ulon);
+                                bool inside_v = point_in_polygon(poly, vlat, vlon);
+                                if (inside_u && inside_v) affected_arcs.push_back(a);
                             }
                         }
 
+                        // Debug: print affected arcs count to backend terminal
+                        std::cout << "[Thread " << std::this_thread::get_id() << "] RESOLVE_POLY affected_arcs count = "
+                                  << affected_arcs.size() << std::endl;
+
                         std::ostringstream oss;
-                        oss << "{\"arc_count\": " << affected_arcs.size() << ", \"arc_ids\": [";
+                        // Include policy marker so upstream can detect cache compatibility
+                        oss << "{\"policy\":\"both_inside\", \"arc_count\": " << affected_arcs.size() << ", \"arc_ids\": [";
                         for (size_t i = 0; i < affected_arcs.size(); ++i) {
                             if (i) oss << ",";
                             oss << affected_arcs[i];
                         }
                         oss << "]";
-                        // add a limited preview of arc endpoint coordinates to help frontend visualize
-                        size_t preview_limit = 500;
+                        // include coordinates for ALL affected arcs to allow full preview on frontend
                         if (!affected_arcs.empty()) {
                             oss << ", \"arc_coords\": [";
                             size_t added = 0;
-                            for (size_t idx = 0; idx < affected_arcs.size() && added < preview_limit; ++idx) {
+                            for (size_t idx = 0; idx < affected_arcs.size(); ++idx) {
                                 unsigned a = affected_arcs[idx];
                                 if (a < g.head.size()) {
-                                    // find source node u quickly using upper_bound on first_out
+                                    // Map arc index -> source node u via first_out sentinel-aware search
+                                    // first_out is expected to have size node_count+1 with last entry == arc_count
                                     unsigned u = 0;
-                                    auto it = std::upper_bound(g.first_out.begin(), g.first_out.begin() + g.node_count, a);
-                                    if (it == g.first_out.begin()) u = 0;
+                                    auto it = std::upper_bound(g.first_out.begin(), g.first_out.end(), a);
+                                    if (it == g.first_out.begin()) u = 0; // safety, though a >= first_out[0] == 0 in valid graphs
                                     else u = static_cast<unsigned>((it - g.first_out.begin()) - 1);
+                                    // bounds safety: clamp u into [0, node_count-1]
+                                    if (u >= g.node_count) u = g.node_count ? (g.node_count - 1) : 0;
+
                                     unsigned v = g.head[a];
                                     double ulat = static_cast<double>(g.latitude[u]);
                                     double ulon = static_cast<double>(g.longitude[u]);

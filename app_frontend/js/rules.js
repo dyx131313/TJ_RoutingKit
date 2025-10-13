@@ -63,10 +63,7 @@ async function previewRule(ruleId) {
     arcPreviewLayers = [];
     let total = 0;
     const groupLayers = [];
-    let MAX_DRAW = 3000;
-    try { const v = parseInt(document.getElementById('previewMaxDraw').value); if (!Number.isNaN(v) && v>0) MAX_DRAW = v; } catch(e){}
     let drawn = 0;
-    const showAllForced = !!(document.getElementById('previewShowAll').dataset.force === '1');
     for (const sig of templates) {
       try {
         let tj = await apiGet(`/api/templates/${encodeURIComponent(sig)}/preview`);
@@ -77,7 +74,6 @@ async function previewRule(ruleId) {
         if (Array.isArray(coords) && coords.length) {
           total += coords.length;
           for (const a of coords) {
-            if (!showAllForced && drawn >= MAX_DRAW) break;
             const line = L.polyline([a.u, a.v], { color: 'blue', weight: 2, opacity: 0.9 }).addTo(map);
             try { line.on('click', function(){ try { map.removeLayer(line); } catch(e){}; try { arcPreviewLayers = arcPreviewLayers.filter(l=>l!==line); } catch(e){}; try { groupLayers.splice(groupLayers.indexOf(line),1); } catch(e){}; try { if (arcPreviewLayers.length === 0) document.getElementById('previewLegend').style.display = 'none'; } catch(e){}; try { document.getElementById('result').innerText = `已移除一条预览弧（剩余 ${arcPreviewLayers.length} 条）`; } catch(e){} }); } catch(e){}
             arcPreviewLayers.push(line);
@@ -94,8 +90,7 @@ async function previewRule(ruleId) {
     } else {
       try { document.getElementById('previewLegend').style.display = 'none'; } catch(e){}
     }
-    const note = drawn < total ? `(显示前 ${drawn} / ${total} 条)` : '';
-    document.getElementById('result').innerText = `规则 ${ruleId} 影响弧数 (预览): ${total} ${note}`;
+    document.getElementById('result').innerText = `规则 ${ruleId} 影响弧数 (预览): ${total}`;
   } catch (e) {
     document.getElementById('result').innerText = '规则预览失败: ' + e;
   }

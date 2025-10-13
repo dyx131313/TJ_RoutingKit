@@ -334,10 +334,18 @@ app.post('/api/resolve_poly', (req, res) => {
 
     if (fs.existsSync(cache_file)) {
         try {
-            const data = fs.readFileSync(cache_file, 'utf8');
-            return res.json(JSON.parse(data));
+            const cached = JSON.parse(fs.readFileSync(cache_file, 'utf8'));
+            // If cached arc_coords are present but appear truncated (legacy 500-cap), force recompute
+            const legacy_truncated = cached && Array.isArray(cached.arc_coords) && Number.isInteger(cached.arc_count) && cached.arc_coords.length < cached.arc_count;
+            const policy_mismatch = !cached || (cached.policy && cached.policy !== 'both_inside') || (!cached.policy);
+            if (legacy_truncated || policy_mismatch) {
+                console.log('resolve_poly: detected partial cached arc_coords (', cached.arc_coords.length, '/', cached.arc_count, '), recomputing...');
+                // fall through to recompute below
+            } else {
+                return res.json(cached);
+            }
         } catch (e) {
-            console.error('Failed to read cache file', e);
+            console.error('Failed to read/parse cache file, will recompute', e);
             // fall through to recompute
         }
     }
@@ -742,18 +750,49 @@ app.get('/api/templates/:sig/preview', (req, res) => {
             const hash = crypto.createHash('sha256').update(canon).digest('hex');
             const cache_file = path.join(CACHE_TEMPLATES_DIR, `resolve_poly_${hash}.json`);
             if (fs.existsSync(cache_file)) {
-                const d = JSON.parse(fs.readFileSync(cache_file,'utf8'));
-                result.precomputed = true;
-                // prefer arc_coords preview if present, else arc_ids
-                if (Array.isArray(d.arc_coords) && d.arc_coords.length > 0) result.preview = { arc_coords: d.arc_coords.slice(0, 200) };
-                else if (Array.isArray(d.arc_ids)) result.preview = { arc_ids: d.arc_ids.slice(0, 500) };
-                return res.json(result);
+                let d;
+                try { d = JSON.parse(fs.readFileSync(cache_file,'utf8')); } catch(e) { d = null; }
+                // If cache exists but arc_coords look truncated, recompute via C++ and refresh cache
+                const needRecompute = !!(d && Array.isArray(d.arc_coords) && Number.isInteger(d.arc_count) && d.arc_coords.length < d.arc_count);
+                const policyMismatch = !d || (d.policy && d.policy !== 'both_inside') || (!d.policy);
+                if (!needRecompute && !policyMismatch && d) {
+                    result.precomputed = true;
+                    if (Array.isArray(d.arc_coords) && d.arc_coords.length > 0) result.preview = { arc_coords: d.arc_coords };
+                    else if (Array.isArray(d.arc_ids)) result.preview = { arc_ids: d.arc_ids };
+                    return res.json(result);
+                } else {
+                    // recompute: call C++ like /api/resolve_poly does, then save and return full data
+                    let cmd = 'RESOLVE_POLY';
+                    for (const p of poly) cmd += `,${p[0]},${p[1]}`;
+                    cmd += '\n';
+                    const client = new net.Socket();
+                    client.connect(CPP_SERVER_PORT, CPP_SERVER_HOST, () => { client.write(cmd); });
+                    let buf = '';
+                    client.on('data', (data) => {
+                        buf += data.toString();
+                        if (buf.includes('\n')) {
+                            try {
+                                const j = JSON.parse(buf);
+                                try { fs.writeFileSync(cache_file, JSON.stringify(j)); } catch(e) { console.error('template preview recompute: failed to write cache', e); }
+                                result.precomputed = true;
+                                if (Array.isArray(j.arc_coords) && j.arc_coords.length > 0) result.preview = { arc_coords: j.arc_coords };
+                                else if (Array.isArray(j.arc_ids)) result.preview = { arc_ids: j.arc_ids };
+                                return res.json(result);
+                            } catch (e) {
+                                console.error('template preview recompute: parse error', e);
+                                return res.status(500).json({ error: 'invalid response from backend' });
+                            }
+                        }
+                    });
+                    client.on('error', (err) => { console.error('template preview recompute: C++ connection error', err.message); return res.status(503).json({ error: 'C++ 服务不可达' }); });
+                    return; // early return; response will be sent in handler above
+                }
             }
         }
         // fallback: if arc_ids present in template, return summary
         if (Array.isArray(arcIds) && arcIds.length > 0) {
             result.precomputed = true;
-            result.preview = { arc_ids: arcIds.slice(0, 500) };
+            result.preview = { arc_ids: arcIds };
             return res.json(result);
         }
         // as last fallback return polygon only
