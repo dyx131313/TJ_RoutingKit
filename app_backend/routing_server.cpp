@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cmath>
 #include <dirent.h>
+#include <sys/resource.h>
 
 // Global configuration
 int GLOBAL_BUCKET_MINUTES = 30;
@@ -72,6 +73,8 @@ struct RoutingData {
     std::vector<std::unique_ptr<BucketState>> bucket_states;
     // base cache directory for this dataset
     std::string cache_base;
+    // PBF file path for reload
+    std::string pbf_file;
 };
 
 // forward declaration for bucket metric loader (defined later)
@@ -390,6 +393,9 @@ void perform_routing(
             std::string metric_unit = "unknown";
             if (routing_data_ptr->graph.travel_time.size() == routing_data_ptr->graph.geo_distance.size()) metric_unit = "ms";
             response_json += "\"metric_unit\": \"" + metric_unit + "\",";
+            // travel_time in seconds (if metric is in ms, divide by 1000)
+            unsigned long travel_time_sec = (metric_unit == "ms") ? (distance / 1000) : distance;
+            response_json += "\"travel_time\": " + std::to_string(travel_time_sec * 1000) + ",";
             response_json += "\"distance_meters\": " + std::to_string(geo_len_round) + ",";
             if (have_geo_arc) response_json += "\"geo_distance_arcs_meters\": " + std::to_string(geo_arc_sum) + ",";
             response_json += "\"path_coordinates\": " + path_json;
@@ -420,6 +426,38 @@ GraphData load_graph_data(const std::string& pbf_file) {
 
     std::cout << "图加载完成. 节点数: " << graph.node_count << ", 边数: " << graph.arc_count << std::endl;
     return graph;
+}
+
+// --- 重新加载图数据 ---
+void reload_graph_data(std::shared_ptr<RoutingData> routing_data, const std::string& pbf_file) {
+    std::cout << "正在重新加载图数据..." << std::endl;
+
+    // 重新加载图数据
+    GraphData new_graph = load_graph_data(pbf_file);
+
+    // 重新初始化 CCH
+    std::cout << "正在重新初始化 CCH..." << std::endl;
+    routing_data->cch.reset();
+    routing_data->traffic_modeler.reset();
+    routing_data->geo_pos_to_node.reset();
+
+    // 使用 nested dissection 排序
+    std::vector<unsigned> tail = new_graph.first_out;
+    tail.push_back(new_graph.arc_count);
+    std::vector<unsigned> order = RoutingKit::compute_nested_node_dissection_order_using_inertial_flow(
+        new_graph.node_count, tail, new_graph.head, new_graph.latitude, new_graph.longitude);
+    routing_data->cch = std::make_unique<RoutingKit::CustomizableContractionHierarchy>(order, tail, new_graph.head);
+    routing_data->traffic_modeler = std::make_unique<RoutingKit::CCHTrafficModeler>(*routing_data->cch, new_graph.travel_time, new_graph.geo_distance, new_graph.arc_count);
+    routing_data->geo_pos_to_node = std::make_unique<RoutingKit::GeoPositionToNode>(new_graph.latitude, new_graph.longitude);
+
+    // 更新图数据
+    routing_data->graph = std::move(new_graph);
+
+    // 重置时间桶度量
+    routing_data->time_bucket_metrics.clear();
+    routing_data->bucket_states.clear();
+
+    std::cout << "图数据重新加载完成." << std::endl;
 }
 
 // --- 简单缓存工具: 计算文件 SHA256、读写向量二进制 ---
@@ -796,6 +834,32 @@ void handle_connection(int client_socket, std::shared_ptr<RoutingData> routing_d
                 std::cout << "[Thread " << std::this_thread::get_id() << "] INFO responded." << std::endl;
                 return;
             }
+            // RELOAD: 重新加载图数据 (不重启进程)
+            if (up0u == "RELOAD") {
+                try {
+                    std::string pbf_file = routing_data->pbf_file; // 使用启动时指定的PBF文件
+                    std::thread reload_thread([routing_data, pbf_file, client_socket]() {
+                        try {
+                            reload_graph_data(routing_data, pbf_file);
+                            std::string resp = "{\"status\": \"success\", \"message\": \"Graph reloaded successfully\"}\n";
+                            send(client_socket, resp.c_str(), resp.length(), 0);
+                            std::cout << "[Thread " << std::this_thread::get_id() << "] RELOAD completed." << std::endl;
+                        } catch (const std::exception& e) {
+                            std::string err = "{\"error\": \"reload failed: " + std::string(e.what()) + "\"}\n";
+                            send(client_socket, err.c_str(), err.length(), 0);
+                            std::cerr << "RELOAD error: " << e.what() << std::endl;
+                        }
+                        close(client_socket);
+                    });
+                    reload_thread.detach();
+                    return;
+                } catch (...) {
+                    std::string err = "{\"error\": \"failed to initiate reload\"}\n";
+                    send(client_socket, err.c_str(), err.length(), 0);
+                    close(client_socket);
+                    return;
+                }
+            }
             // RESOLVE_POLY: RESOLVE_POLY,<lat1>,<lon1>,<lat2>,<lon2>,...,<latN>,<lonN>
             if (up0u == "RESOLVE_POLY") {
                 if (params.size() >= 7 && ((params.size() - 1) % 2 == 0)) {
@@ -956,6 +1020,7 @@ int main(int argc, char* argv[]) {
     std::string pbf_file;
     int bucket_minutes = 30;
     int bucket_count = 0;
+    std::vector<std::string> profiles_to_load;
 
     try {
         cxxopts::Options options(argv[0], "TJ_RoutingKit - 路由计算后台服务 (TCP模式)");
@@ -963,6 +1028,7 @@ int main(int argc, char* argv[]) {
             ("p,pbf", "PBF文件路径", cxxopts::value<std::string>())
             ("bucket-minutes", "时间桶粒度（分钟）", cxxopts::value<int>()->default_value("30"))
             ("buckets", "预构建时间桶数量（0表示不预构建）", cxxopts::value<int>()->default_value("0"))
+            ("profiles", "预加载的交通配置文件（逗号分隔: normal,morning_peak,evening_peak）", cxxopts::value<std::string>()->default_value("normal"))
             ("h,help", "打印帮助信息");
         
         auto result = options.parse(argc, argv);
@@ -980,7 +1046,26 @@ int main(int argc, char* argv[]) {
     pbf_file = result["pbf"].as<std::string>();
     bucket_minutes = result["bucket-minutes"].as<int>();
     bucket_count = result["buckets"].as<int>();
+    std::string profiles_str = result["profiles"].as<std::string>();
     if (bucket_minutes > 0) GLOBAL_BUCKET_MINUTES = bucket_minutes;
+
+    // 解析需要预加载的 profiles
+    std::stringstream ss(profiles_str);
+    std::string p;
+    while (std::getline(ss, p, ',')) {
+        // trim
+        while (!p.empty() && isspace((unsigned char)p.front())) p.erase(0,1);
+        while (!p.empty() && isspace((unsigned char)p.back())) p.pop_back();
+        if (!p.empty()) profiles_to_load.push_back(p);
+    }
+    // 默认至少加载 normal
+    if (profiles_to_load.empty()) profiles_to_load.push_back("normal");
+    std::cout << "将预加载 profiles: ";
+    for (size_t i = 0; i < profiles_to_load.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << profiles_to_load[i];
+    }
+    std::cout << std::endl;
 
     } catch (const cxxopts::exceptions::exception& e) {
         std::cerr << "解析选项时出错: " << e.what() << std::endl;
@@ -1021,6 +1106,8 @@ int main(int argc, char* argv[]) {
     
     try {
         routing_data->graph = load_graph_data(pbf_file);
+        // 保存PBF文件路径以便RELOAD命令使用
+        routing_data->pbf_file = pbf_file;
 
         // Prepare cache directory based on PBF file hash.
         // Place cache inside the TJ_RoutingKit repository if possible.
@@ -1089,9 +1176,22 @@ int main(int argc, char* argv[]) {
         }
 
         routing_data->traffic_modeler = std::make_unique<RoutingKit::CCHTrafficModeler>(*routing_data->cch, routing_data->graph.travel_time, routing_data->graph.geo_distance, routing_data->graph.arc_count);
-        routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::NORMAL);
-        routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::MORNING_PEAK);
-        routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::EVENING_PEAK);
+
+        // 只加载指定的 profiles（默认只有 normal）
+        for (const auto& profile_name : profiles_to_load) {
+            if (profile_name == "normal" || profile_name == "Normal" || profile_name == "NORMAL") {
+                routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::NORMAL);
+                std::cout << "Built NORMAL metric" << std::endl;
+            } else if (profile_name == "morning_peak" || profile_name == "morning" || profile_name == "morningpeak") {
+                routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::MORNING_PEAK);
+                std::cout << "Built MORNING_PEAK metric" << std::endl;
+            } else if (profile_name == "evening_peak" || profile_name == "evening" || profile_name == "eveningpeak") {
+                routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::EVENING_PEAK);
+                std::cout << "Built EVENING_PEAK metric" << std::endl;
+            } else {
+                std::cerr << "Unknown profile: " << profile_name << ", skipping" << std::endl;
+            }
+        }
 
         // prepare time bucket metrics (initial simple implementation)
         if (bucket_count > 0) {

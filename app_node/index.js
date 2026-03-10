@@ -2,6 +2,12 @@ const express = require('express');
 const net = require('net');
 const path = require('path');
 const monitor = require('express-status-monitor');
+const cors = require('cors');
+
+// 内存监控
+const { createFullMemoryMonitor, getMemoryUsage, findCppServerProcess } = require('./utils/memoryMonitor.js');
+// 启动内存监控（每30秒输出一次，Node阈值500MB，C++阈值2000MB）
+const memoryMonitor = createFullMemoryMonitor(30000, 500, 2000);
 
 const app = express();
 const port = 3000;
@@ -10,6 +16,8 @@ const port = 3000;
 const CPP_SERVER_HOST = '127.0.0.1';
 const CPP_SERVER_PORT = 12345;
 
+// Enable CORS for all origins (development)
+app.use(cors());
 app.use(monitor());
 // Serve the bundled frontend that lives in the repo under app_frontend
 app.use(express.static(path.resolve(__dirname, '../app_frontend')));
@@ -87,21 +95,26 @@ app.get('/route', (req, res) => {
     }
     // if rule_id provided, ensure rule metric exists (build it) and expose as metric_sig_<id>.bin
     const rule_id = req.query.rule_id || '';
+    console.log('=== ROUTE REQUEST ===');
+    console.log('rule_id:', rule_id);
     if (rule_id) {
         (async () => {
             try {
                 // attempt to build metric for rule (if already built, buildMetricForRule will update metadata)
                 const br = await buildMetricForRule(rule_id, undefined);
+                console.log('Metric built:', br);
                 // ensure metric_sig_<rule_id>.bin exists alongside metric_rule_<rule_id>.bin
                 const outdir = path.join(path.resolve(__dirname, '..', 'cache'), PBF_HASH);
+                console.log('Outdir:', outdir);
                 const sigPath = path.join(outdir, `metric_sig_${rule_id}.bin`);
+                console.log('Sig path:', sigPath, 'exists:', fs.existsSync(sigPath));
                 try {
                     if (!fs.existsSync(sigPath)) {
                         try { fs.linkSync(br.path, sigPath); } catch (e) { fs.copyFileSync(br.path, sigPath); }
                     }
                 } catch (e) { console.warn('failed to create metric_sig link for rule', e); }
             } catch (e) {
-                console.warn('route: failed to build/ensure rule metric', e.message || e);
+                console.error('route: failed to build/ensure rule metric', e.message || e);
                 // continue — route may still be computed without rule metric
             }
             handle_request(req, res);
@@ -112,14 +125,33 @@ app.get('/route', (req, res) => {
     handle_request(req, res);
 });
 
-app.get('/health', (req, res) => {
+app.get('/health', async (_req, res) => {
+    const mem = getMemoryUsage();
+    // 获取 C++ 进程内存信息
+    let cppProcess = null;
+    try {
+        cppProcess = await findCppServerProcess();
+    } catch (e) {
+        // ignore
+    }
+
     const client = new net.Socket();
     client.connect(CPP_SERVER_PORT, CPP_SERVER_HOST, () => {
-        res.send('服务运行正常。C++ 路由计算服务可达。');
+        res.json({
+            status: 'ok',
+            message: 'C++ 路由计算服务可达',
+            node_memory: mem,
+            cpp_process: cppProcess,
+        });
         client.end();
     });
     client.on('error', (err) => {
-        res.status(503).send('服务运行正常，但 C++ 路由计算服务不可达。');
+        res.status(503).json({
+            status: 'degraded',
+            message: 'C++ 路由计算服务不可达',
+            node_memory: mem,
+            cpp_process: cppProcess,
+        });
     });
 });
 
@@ -162,7 +194,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 // Determine PBF hash for per-dataset cache. Prefer env `PBF_HASH`, else try to find
-// a hex-named subdirectory under ../cache. Fallback to 'unknown'.
+// a hex-named subdirectory under ../cache. Fallback to auto-detecting PBF file.
 function detectPbfHash() {
     if (process.env.PBF_HASH && /^[0-9a-f]{64}$/.test(process.env.PBF_HASH)) return process.env.PBF_HASH;
     const base = path.resolve(__dirname, '../cache');
@@ -173,6 +205,28 @@ function detectPbfHash() {
         }
     } catch (e) {
         // ignore
+    }
+    // Auto-detect PBF file and compute hash
+    try {
+        const dataDir = path.resolve(__dirname, '../data');
+        const files = fs.readdirSync(dataDir);
+        for (const f of files) {
+            if (f.endsWith('.osm.pbf')) {
+                const pbfPath = path.join(dataDir, f);
+                const pbfData = fs.readFileSync(pbfPath);
+                const hash = crypto.createHash('sha256').update(pbfData).digest('hex');
+                console.log('Auto-detected PBF file:', f, 'hash:', hash);
+                // Create cache directory for this hash
+                const cacheDir = path.join(base, hash);
+                if (!fs.existsSync(cacheDir)) {
+                    fs.mkdirSync(cacheDir, { recursive: true });
+                    console.log('Created cache directory:', cacheDir);
+                }
+                return hash;
+            }
+        }
+    } catch (e) {
+        console.warn('Failed to auto-detect PBF file:', e.message);
     }
     return 'unknown';
 }
@@ -246,9 +300,12 @@ function collectAffectedArcsFromTemplates(templateSigs) {
 
 // Build merged metric for a rule (write metric_rule_<id>.bin)
 async function buildMetricForRule(ruleId, bigValue) {
+    console.log('buildMetricForRule called:', ruleId);
     const rule = readRule(ruleId);
     if (!rule) throw new Error('rule not found');
+    console.log('Building metric for rule:', rule.name, 'templates:', rule.templates);
     const affected = collectAffectedArcsFromTemplates(rule.templates || []);
+    console.log('Affected arcs count:', affected.length);
     if (!Array.isArray(affected) || affected.length === 0) throw new Error('no affected arcs');
 
     // determine travel_time_count from C++ INFO
@@ -272,13 +329,17 @@ async function buildMetricForRule(ruleId, bigValue) {
     let estimated = 0;
     try { const c = await queryCppInfo(); if (c && Number.isInteger(c)) estimated = c; } catch(e) {}
     if (!estimated) {
-        // fallback: pick max affected + 1
-        estimated = (affected.length ? (affected[affected.length-1]+1) : 0);
+        // fallback: 使用 affected 中最大的 arc_id + 1
+        const maxArcId = affected.length ? Math.max(...affected) : 0;
+        estimated = maxArcId + 1;
     }
+    console.log('Using estimated arc count:', estimated);
 
+    // 使用1000作为默认权重（毫秒）
     const weights = new Array(estimated).fill(1000);
-    const BIG = Number.isFinite(bigValue) ? bigValue : 1000000000;
+    const BIG = Number.isFinite(bigValue) ? bigValue : 1000000000; // 10亿作为阻塞值
     for (const a of affected) if (a >=0 && a < weights.length) weights[a] = BIG;
+    console.log('Set BIG weight for', affected.length, 'arcs');
 
     const outdir = path.join(path.resolve(__dirname, '..', 'cache'), PBF_HASH);
     try { fs.mkdirSync(outdir, { recursive: true }); } catch(e) {}
@@ -287,6 +348,7 @@ async function buildMetricForRule(ruleId, bigValue) {
     buf.writeBigUInt64LE(BigInt(weights.length), 0);
     for (let i=0;i<weights.length;i++) buf.writeUInt32LE(weights[i], 8 + i*4);
     fs.writeFileSync(outpath, buf);
+    console.log('Written metric file:', outpath);
     // ensure a metric_sig_<ruleId>.bin peer file exists so C++ can load by signature
     const sigPath = path.join(outdir, `metric_sig_${ruleId}.bin`);
     try {
@@ -295,6 +357,7 @@ async function buildMetricForRule(ruleId, bigValue) {
         try { fs.linkSync(outpath, sigPath); }
         catch (e) { try { fs.copyFileSync(outpath, sigPath); } catch (e2) { console.warn('failed to create metric_sig peer file (copy failed)', e2); } }
     } catch (e) { console.warn('failed to create metric_sig peer file', e); }
+    console.log('Created metric_sig file:', sigPath, 'exists:', fs.existsSync(sigPath));
     // update rule metadata
     rule.metric_path = outpath;
     rule.merged_arc_count = affected.length;
