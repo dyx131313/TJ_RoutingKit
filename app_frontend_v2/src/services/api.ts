@@ -22,7 +22,9 @@ export async function queryRoute(
   to: string,
   profile: Profile = 'normal',
   metricSig?: string,
-  ruleId?: string
+  ruleId?: string,
+  plate?: string,
+  queryDate?: string
 ): Promise<RouteResult> {
   const params = new URLSearchParams({
     from,
@@ -35,6 +37,12 @@ export async function queryRoute(
   }
   if (ruleId) {
     params.append('rule_id', ruleId);
+  }
+  if (plate) {
+    params.append('plate', plate);
+  }
+  if (queryDate) {
+    params.append('query_date', queryDate);
   }
 
   const response = await api.get<RouteResult>(`/route?${params}`);
@@ -127,6 +135,12 @@ export async function createRule(data: {
   name: string;
   description?: string;
   templates: string[];
+  plate_policy?: {
+    enabled?: boolean;
+    tails?: string[];
+    weekdays?: number[];
+    time_windows?: Array<{ start: string; end: string }>;
+  };
 }): Promise<Rule> {
   const response = await api.post<Rule>('/api/rules', data);
   return response.data;
@@ -141,7 +155,16 @@ export async function getRule(id: string): Promise<Rule> {
 // 更新规则
 export async function updateRule(
   id: string,
-  data: { name?: string; description?: string }
+  data: {
+    name?: string;
+    description?: string;
+    plate_policy?: {
+      enabled?: boolean;
+      tails?: string[];
+      weekdays?: number[];
+      time_windows?: Array<{ start: string; end: string }>;
+    };
+  }
 ): Promise<Rule> {
   const response = await api.put<Rule>(`/api/rules/${id}`, data);
   return response.data;

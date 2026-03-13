@@ -41,12 +41,20 @@ cd TJ_RoutingKit/app_backend
 make
 
 # 启动路由服务（需要指定 PBF 数据文件）
-./routing_server --pbf ../data/shanghai-250916.osm.pbf
+./routing_server --pbf ../data/shanghai-250916.osm.pbf --profiles normal,morning_peak,evening_peak,walking,bus --use-perfect-witness true
 ```
 
 **端口**: 12345
 
 首次启动会自动加载 CCH 索引和地图数据。
+
+如果当前数据集上 perfect witness 构建失败，服务会自动降级为普通 CCH，并把状态写入 `cache/<pbf-hash>/perfect_witness_status.txt`。后续启动会读取该状态并跳过重复失败构建。
+
+如需手动重试构建：
+
+```bash
+./routing_server --pbf ../data/shanghai-250916.osm.pbf --use-perfect-witness true --force-rebuild-perfect-witness true
+```
 
 ---
 
@@ -116,7 +124,7 @@ http://localhost:5173
 redis-server &
 
 # 终端 2: C++ 路由服务
-cd TJ_RoutingKit/app_backend && ./routing_server --pbf ../data/shanghai-250916.osm.pbf
+cd TJ_RoutingKit/app_backend && ./routing_server --pbf ../data/shanghai-250916.osm.pbf --profiles normal,morning_peak,evening_peak,walking,bus --use-perfect-witness true
 
 # 终端 3: Node.js API
 cd TJ_RoutingKit/app_node && nvm use 20 && npm run start
@@ -149,10 +157,26 @@ redis-cli ping
 
 首次启动需要加载 CCH 索引（约 20-30 秒），请耐心等待。
 
+### 一键验收（P0/P1/P3）
+
+服务启动后可执行：
+
+```bash
+cd TJ_RoutingKit
+./tools/acceptance_p0_p1_p3.sh
+```
+
+脚本会验证：
+- 路由缓存 flush 接口
+- normal/walking/bus 三种 profile 查询
+- 增量更新接口 `/api/graph/update_weights`
+- 车牌策略命中/未命中行为
+- 路由缓存基本命中回归
+
 ---
 
 ## 下一步
 
 - 查看 [API 文档](./api.md) 了解接口详情
 - 查看 [前端文档](./frontend.md) 了解组件结构
-- 查看 [数据库文档](./database.md) 了解存储设计
+- 查看 [阶段总结](./progress-summary-2026-03.md) 了解当前完成情况与边界

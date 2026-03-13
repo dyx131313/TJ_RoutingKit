@@ -77,7 +77,27 @@ std::vector<unsigned> CCHTrafficModeler::generate_weights_for_profile(TrafficPro
 
     std::uniform_real_distribution<> dis_simple(0.0, 1.0);
 
-    if (profile == TrafficProfile::MORNING_PEAK || profile == TrafficProfile::EVENING_PEAK) {
+    if (profile == TrafficProfile::WALKING) {
+        for (unsigned i = 0; i < arc_count; ++i) {
+            // walking speed ~= 5 km/h => 1.3889 m/s
+            float geo_m = static_cast<float>(geo_distance[i]);
+            float walk_ms = (geo_m / 1.3889f) * 1000.0f;
+            if (walk_ms < 1.0f) walk_ms = 1.0f;
+            multi_weights[i].base_weight = walk_ms;
+            multi_weights[i].congestion = 0.0f;
+        }
+    } else if (profile == TrafficProfile::BUS) {
+        for (unsigned i = 0; i < arc_count; ++i) {
+            // pragmatic bus metric: faster cruising than normal with short-link stop penalty
+            float base = static_cast<float>(base_travel_time[i]);
+            float geo_m = static_cast<float>(geo_distance[i]);
+            float bus_ms = base * 0.85f;
+            if (geo_m < 250.0f) bus_ms += 20000.0f;
+            if (bus_ms < 1.0f) bus_ms = 1.0f;
+            multi_weights[i].base_weight = bus_ms;
+            multi_weights[i].congestion = 0.0f;
+        }
+    } else if (profile == TrafficProfile::MORNING_PEAK || profile == TrafficProfile::EVENING_PEAK) {
         for(unsigned i = 0; i < arc_count; ++i) {
             float speed = 0.0f;
             if (base_travel_time[i] > 0) {

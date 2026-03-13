@@ -7,6 +7,8 @@ export function useRoute() {
   const {
     profile,
     ruleId,
+    plate,
+    queryDate,
     setRouteResult,
     setRouteCoords,
     setLoading,
@@ -26,7 +28,7 @@ export function useRoute() {
     setError(null);
     clearRoute();
 
-    console.log('executeRoute:', { from, to, profile, ruleId });
+    console.log('executeRoute:', { from, to, profile, ruleId, plate, queryDate });
 
     try {
       const result = await queryRoute(
@@ -34,7 +36,9 @@ export function useRoute() {
         `${to.lat},${to.lon}`,
         profile,
         undefined,
-        ruleId || undefined
+        ruleId || undefined,
+        plate || undefined,
+        queryDate || undefined
       );
 
       console.log('Route result:', result);
@@ -47,7 +51,7 @@ export function useRoute() {
       setError(message);
       setLoading(false);
     }
-  }, [from, to, profile, ruleId, setRouteResult, setRouteCoords, setLoading, setError, clearRoute]);
+  }, [from, to, profile, ruleId, plate, queryDate, setRouteResult, setRouteCoords, setLoading, setError, clearRoute]);
 
   return {
     executeRoute,

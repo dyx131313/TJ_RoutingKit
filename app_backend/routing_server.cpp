@@ -75,6 +75,9 @@ struct RoutingData {
     std::string cache_base;
     // PBF file path for reload
     std::string pbf_file;
+    // Optional perfect-witness CH for normal-profile query.
+    std::unique_ptr<RoutingKit::ContractionHierarchy> perfect_witness_ch;
+    bool use_perfect_witness = false;
 };
 
 // forward declaration for bucket metric loader (defined later)
@@ -234,6 +237,12 @@ void perform_routing(
             } else if (profile_str == "evening_peak") {
                 metric = &routing_data_ptr->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::EVENING_PEAK);
                 metric_source = "traffic_modeler:evening_peak";
+            } else if (profile_str == "walking") {
+                metric = &routing_data_ptr->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::WALKING);
+                metric_source = "traffic_modeler:walking";
+            } else if (profile_str == "bus") {
+                metric = &routing_data_ptr->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::BUS);
+                metric_source = "traffic_modeler:bus";
             } else {
                 // if bucketed metrics are available and query_time_sec provided, pick bucket
                 auto rd_ptr = routing_data_ptr; // convenience
@@ -259,15 +268,33 @@ void perform_routing(
         }
         std::cout << "[Thread " << std::this_thread::get_id() << "] Got CCH metric for profile: " << profile_str << std::endl;
 
-                RoutingKit::CustomizableContractionHierarchyQuery query(*metric);
-        query.reset().add_source(source_node).add_target(target_node).run();
-        std::cout << "[Thread " << std::this_thread::get_id() << "] CCH query finished." << std::endl;
-        
-    unsigned distance = query.get_distance();
+        unsigned distance = RoutingKit::inf_weight;
+        std::vector<unsigned> path_nodes;
+        std::vector<unsigned> arc_path;
+        bool have_arc_path = false;
+
+        bool can_use_pw = routing_data_ptr->use_perfect_witness
+                        && routing_data_ptr->perfect_witness_ch
+                        && metric_sig.empty()
+                        && profile_str == "normal";
+        if (can_use_pw) {
+            RoutingKit::ContractionHierarchyQuery pw_query(*routing_data_ptr->perfect_witness_ch);
+            pw_query.reset().add_source(source_node).add_target(target_node).run();
+            distance = pw_query.get_distance();
+            path_nodes = pw_query.get_node_path();
+            metric_source = "perfect_witness:normal";
+            std::cout << "[Thread " << std::this_thread::get_id() << "] Perfect witness query finished." << std::endl;
+        } else {
+            RoutingKit::CustomizableContractionHierarchyQuery query(*metric);
+            query.reset().add_source(source_node).add_target(target_node).run();
+            distance = query.get_distance();
+            path_nodes = query.get_node_path();
+            arc_path = query.get_arc_path();
+            have_arc_path = true;
+            std::cout << "[Thread " << std::this_thread::get_id() << "] CCH query finished." << std::endl;
+        }
 
     std::cout << "[Thread " << std::this_thread::get_id() << "] Got distance: " << distance << std::endl;
-
-        std::vector<unsigned> path_nodes = query.get_node_path();
         
         std::cout << "[Thread " << std::this_thread::get_id() << "] Got path with " << path_nodes.size() << " nodes." << std::endl;
 
@@ -353,10 +380,17 @@ void perform_routing(
             // compute arc-based geo_distance sum if graph.geo_distance is available
             unsigned long geo_arc_sum = 0;
             bool have_geo_arc = false;
+            // compute arc-based base travel_time(ms) sum for a physically meaningful ETA,
+            // especially when custom signature metrics use synthetic penalties.
+            unsigned long base_arc_time_ms = 0;
+            bool have_base_arc_time = false;
+            std::vector<unsigned> arc_path_cached;
+            bool arc_path_ready = false;
             if (path_nodes.size() >= 2 && routing_data_ptr->graph.geo_distance.size() > 0) {
                 // prefer using the arc path returned by the CCH query when available
-                std::vector<unsigned> arc_path = query.get_arc_path();
                 if (!arc_path.empty()) {
+                    arc_path_cached = arc_path;
+                    arc_path_ready = true;
                     have_geo_arc = true;
                     for (unsigned a : arc_path) {
                         if (a < routing_data_ptr->graph.geo_distance.size()) geo_arc_sum += routing_data_ptr->graph.geo_distance[a];
@@ -385,6 +419,38 @@ void perform_routing(
                 }
             }
 
+            if (path_nodes.size() >= 2 && routing_data_ptr->graph.travel_time.size() > 0) {
+                const std::vector<unsigned> &tt = routing_data_ptr->graph.travel_time;
+                if (!arc_path_ready && have_arc_path) {
+                    arc_path_cached = arc_path;
+                    arc_path_ready = true;
+                }
+                if (!arc_path_cached.empty()) {
+                    have_base_arc_time = true;
+                    for (unsigned a : arc_path_cached) {
+                        if (a < tt.size()) base_arc_time_ms += tt[a];
+                        else { have_base_arc_time = false; break; }
+                    }
+                } else {
+                    have_base_arc_time = true;
+                    for (size_t i = 1; i < path_nodes.size(); ++i) {
+                        unsigned u = path_nodes[i-1];
+                        unsigned v = path_nodes[i];
+                        unsigned start = routing_data_ptr->graph.first_out[u];
+                        unsigned end = (u+1 < routing_data_ptr->graph.first_out.size()) ? routing_data_ptr->graph.first_out[u+1] : routing_data_ptr->graph.arc_count;
+                        bool found = false;
+                        for (unsigned a = start; a < end; ++a) {
+                            if (routing_data_ptr->graph.head[a] == v) {
+                                if (a < tt.size()) base_arc_time_ms += tt[a];
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) { have_base_arc_time = false; break; }
+                    }
+                }
+            }
+
             response_json = "{";
             // original `distance` is the sum of metric weights (may represent travel_time/ms or other units)
             response_json += "\"metric_distance\": " + std::to_string(distance) + ",";
@@ -393,9 +459,18 @@ void perform_routing(
             std::string metric_unit = "unknown";
             if (routing_data_ptr->graph.travel_time.size() == routing_data_ptr->graph.geo_distance.size()) metric_unit = "ms";
             response_json += "\"metric_unit\": \"" + metric_unit + "\",";
-            // travel_time in seconds (if metric is in ms, divide by 1000)
-            unsigned long travel_time_sec = (metric_unit == "ms") ? (distance / 1000) : distance;
-            response_json += "\"travel_time\": " + std::to_string(travel_time_sec * 1000) + ",";
+            // Keep raw metric-time for diagnostics.
+            unsigned long metric_time_ms = (metric_unit == "ms") ? static_cast<unsigned long>(distance) : static_cast<unsigned long>(distance) * 1000UL;
+            // For signature metrics, use base graph travel_time as reported ETA when available.
+            // Signature metric often encodes penalties rather than real traffic-time values.
+            unsigned long reported_travel_time_ms = metric_time_ms;
+            bool using_signature_metric = (metric_source.rfind("signature:", 0) == 0);
+            if (using_signature_metric && have_base_arc_time) {
+                reported_travel_time_ms = base_arc_time_ms;
+            }
+            response_json += "\"travel_time\": " + std::to_string(reported_travel_time_ms) + ",";
+            response_json += "\"metric_travel_time\": " + std::to_string(metric_time_ms) + ",";
+            if (have_base_arc_time) response_json += "\"base_travel_time\": " + std::to_string(base_arc_time_ms) + ",";
             response_json += "\"distance_meters\": " + std::to_string(geo_len_round) + ",";
             if (have_geo_arc) response_json += "\"geo_distance_arcs_meters\": " + std::to_string(geo_arc_sum) + ",";
             response_json += "\"path_coordinates\": " + path_json;
@@ -586,6 +661,81 @@ static bool load_metric_marker(const std::string &cache_dir, int bucket_idx) {
     std::string path = cache_dir + "/metric_bucket_" + std::to_string(bucket_idx) + ".meta";
     std::ifstream in(path);
     return !!in;
+}
+
+struct PerfectWitnessStatus {
+    bool exists = false;
+    bool enabled = false;
+    std::string reason;
+};
+
+static bool save_perfect_witness_status(const std::string &cache_dir, bool enabled, const std::string &reason) {
+    if (!ensure_dir_exists(cache_dir)) return false;
+    std::string tmp = cache_dir + "/perfect_witness_status.txt.tmp";
+    std::string finalp = cache_dir + "/perfect_witness_status.txt";
+    std::ofstream out(tmp);
+    if (!out) return false;
+    std::time_t t = std::time(nullptr);
+    out << "enabled=" << (enabled ? "1" : "0") << "\n";
+    out << "updated_at=" << std::asctime(std::localtime(&t));
+    out << "reason=" << reason << "\n";
+    out.close();
+    if (!out.good()) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), finalp.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static PerfectWitnessStatus load_perfect_witness_status(const std::string &cache_dir) {
+    PerfectWitnessStatus st;
+    std::string path = cache_dir + "/perfect_witness_status.txt";
+    std::ifstream in(path);
+    if (!in) return st;
+    st.exists = true;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("enabled=", 0) == 0) {
+            std::string val = line.substr(8);
+            st.enabled = (val == "1" || val == "true" || val == "yes");
+        } else if (line.rfind("reason=", 0) == 0) {
+            st.reason = line.substr(7);
+        }
+    }
+    return st;
+}
+
+static bool validate_perfect_witness(
+    const RoutingKit::ContractionHierarchy &pw_ch,
+    const RoutingKit::CustomizableContractionHierarchyMetric &normal_metric,
+    unsigned node_count)
+{
+    if (node_count < 2) return false;
+    const unsigned max_checks = 6;
+    for (unsigned i = 0; i < max_checks; ++i) {
+        unsigned s = (i * 2654435761u) % node_count;
+        unsigned t = (s + 104729u + i * 17u) % node_count;
+        if (s == t) t = (t + 1u) % node_count;
+
+        RoutingKit::ContractionHierarchyQuery q_pw(pw_ch);
+        q_pw.reset().add_source(s).add_target(t).run();
+        unsigned d_pw = q_pw.get_distance();
+
+        RoutingKit::CustomizableContractionHierarchyQuery q_normal(normal_metric);
+        q_normal.reset().add_source(s).add_target(t).run();
+        unsigned d_normal = q_normal.get_distance();
+
+        if (d_pw != d_normal) {
+            std::cerr << "Perfect witness validation mismatch: source=" << s
+                      << " target=" << t << " pw=" << d_pw << " normal=" << d_normal << std::endl;
+            return false;
+        }
+    }
+    return true;
 }
 
 // Save/Load arc-weight vector for a specific bucket. We store travel_time-like weights as unsigned ints.
@@ -860,6 +1010,61 @@ void handle_connection(int client_socket, std::shared_ptr<RoutingData> routing_d
                     return;
                 }
             }
+            // UPDATE_ARCS: UPDATE_ARCS,<arc_id>,<new_weight_ms>,...
+            if (up0u == "UPDATE_ARCS") {
+                try {
+                    if (params.size() < 3 || ((params.size() - 1) % 2 != 0)) {
+                        std::string err = "{\"error\":\"UPDATE_ARCS 参数错误，格式: UPDATE_ARCS,arc1,w1,arc2,w2,...\"}\n";
+                        send(client_socket, err.c_str(), err.length(), 0);
+                        close(client_socket);
+                        return;
+                    }
+
+                    unsigned applied = 0;
+                    for (size_t i = 1; i + 1 < params.size(); i += 2) {
+                        long long arc_id = std::stoll(params[i]);
+                        long long w = std::stoll(params[i + 1]);
+                        if (arc_id < 0 || arc_id >= (long long)routing_data->graph.travel_time.size() || w <= 0) continue;
+                        routing_data->graph.travel_time[(size_t)arc_id] = (unsigned)w;
+                        applied++;
+                    }
+
+                    routing_data->traffic_modeler = std::make_unique<RoutingKit::CCHTrafficModeler>(
+                        *routing_data->cch,
+                        routing_data->graph.travel_time,
+                        routing_data->graph.geo_distance,
+                        routing_data->graph.arc_count
+                    );
+                    routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::NORMAL);
+                    routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::MORNING_PEAK);
+                    routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::EVENING_PEAK);
+                    routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::WALKING);
+                    routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::BUS);
+
+                    if (routing_data->use_perfect_witness) {
+                        try {
+                            auto &normal_metric = routing_data->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::NORMAL);
+                            routing_data->perfect_witness_ch = std::make_unique<RoutingKit::ContractionHierarchy>(
+                                normal_metric.build_contraction_hierarchy_using_perfect_witness_search()
+                            );
+                        } catch (...) {
+                            // keep service alive even if optional rebuild fails
+                        }
+                    }
+
+                    std::ostringstream oss;
+                    oss << "{\"updated_arcs\": " << applied << ", \"status\": \"ok\"}" << "\n";
+                    std::string resp = oss.str();
+                    send(client_socket, resp.c_str(), resp.length(), 0);
+                    close(client_socket);
+                    return;
+                } catch (const std::exception &e) {
+                    std::string err = std::string("{\"error\":\"UPDATE_ARCS failed: ") + e.what() + "\"}\n";
+                    send(client_socket, err.c_str(), err.length(), 0);
+                    close(client_socket);
+                    return;
+                }
+            }
             // RESOLVE_POLY: RESOLVE_POLY,<lat1>,<lon1>,<lat2>,<lon2>,...,<latN>,<lonN>
             if (up0u == "RESOLVE_POLY") {
                 if (params.size() >= 7 && ((params.size() - 1) % 2 == 0)) {
@@ -908,10 +1113,12 @@ void handle_connection(int client_socket, std::shared_ptr<RoutingData> routing_d
                                 if (std::max(ulon, vlon) < minlon) continue;
                                 if (std::min(ulon, vlon) > maxlon) continue;
 
-                                // New policy: an arc is affected ONLY if BOTH endpoints are inside polygon
+                                // An arc is affected if either endpoint is inside polygon,
+                                // or the arc segment crosses polygon boundary.
                                 bool inside_u = point_in_polygon(poly, ulat, ulon);
                                 bool inside_v = point_in_polygon(poly, vlat, vlon);
-                                if (inside_u && inside_v) affected_arcs.push_back(a);
+                                bool crosses = segment_intersects_polygon(poly, ulat, ulon, vlat, vlon);
+                                if (inside_u || inside_v || crosses) affected_arcs.push_back(a);
                             }
                         }
 
@@ -921,7 +1128,7 @@ void handle_connection(int client_socket, std::shared_ptr<RoutingData> routing_d
 
                         std::ostringstream oss;
                         // Include policy marker so upstream can detect cache compatibility
-                        oss << "{\"policy\":\"both_inside\", \"arc_count\": " << affected_arcs.size() << ", \"arc_ids\": [";
+                        oss << "{\"policy\":\"inside_or_intersect\", \"arc_count\": " << affected_arcs.size() << ", \"arc_ids\": [";
                         for (size_t i = 0; i < affected_arcs.size(); ++i) {
                             if (i) oss << ",";
                             oss << affected_arcs[i];
@@ -1020,6 +1227,8 @@ int main(int argc, char* argv[]) {
     std::string pbf_file;
     int bucket_minutes = 30;
     int bucket_count = 0;
+    bool use_perfect_witness = true;
+    bool force_rebuild_perfect_witness = false;
     std::vector<std::string> profiles_to_load;
 
     try {
@@ -1028,7 +1237,9 @@ int main(int argc, char* argv[]) {
             ("p,pbf", "PBF文件路径", cxxopts::value<std::string>())
             ("bucket-minutes", "时间桶粒度（分钟）", cxxopts::value<int>()->default_value("30"))
             ("buckets", "预构建时间桶数量（0表示不预构建）", cxxopts::value<int>()->default_value("0"))
-            ("profiles", "预加载的交通配置文件（逗号分隔: normal,morning_peak,evening_peak）", cxxopts::value<std::string>()->default_value("normal"))
+            ("profiles", "预加载的交通配置文件（逗号分隔: normal,morning_peak,evening_peak,walking,bus）", cxxopts::value<std::string>()->default_value("normal,walking,bus"))
+            ("use-perfect-witness", "启用完美见证搜索构建 normal CH 并在 normal 查询中使用", cxxopts::value<bool>()->default_value("true"))
+            ("force-rebuild-perfect-witness", "忽略缓存状态并强制尝试重建 perfect witness", cxxopts::value<bool>()->default_value("false"))
             ("h,help", "打印帮助信息");
         
         auto result = options.parse(argc, argv);
@@ -1046,6 +1257,8 @@ int main(int argc, char* argv[]) {
     pbf_file = result["pbf"].as<std::string>();
     bucket_minutes = result["bucket-minutes"].as<int>();
     bucket_count = result["buckets"].as<int>();
+    use_perfect_witness = result["use-perfect-witness"].as<bool>();
+    force_rebuild_perfect_witness = result["force-rebuild-perfect-witness"].as<bool>();
     std::string profiles_str = result["profiles"].as<std::string>();
     if (bucket_minutes > 0) GLOBAL_BUCKET_MINUTES = bucket_minutes;
 
@@ -1108,6 +1321,7 @@ int main(int argc, char* argv[]) {
         routing_data->graph = load_graph_data(pbf_file);
         // 保存PBF文件路径以便RELOAD命令使用
         routing_data->pbf_file = pbf_file;
+        routing_data->use_perfect_witness = use_perfect_witness;
 
         // Prepare cache directory based on PBF file hash.
         // Place cache inside the TJ_RoutingKit repository if possible.
@@ -1144,6 +1358,9 @@ int main(int argc, char* argv[]) {
         }
 
         std::string cache_base = repo_root + "/cache/" + hash_sub;
+        // cache_base is also used by metric_sig loading path in perform_routing,
+        // so set it regardless of whether time-bucket metrics are enabled.
+        routing_data->cache_base = cache_base;
 
         auto tail = RoutingKit::invert_inverse_vector(routing_data->graph.first_out);
         std::vector<unsigned> order;
@@ -1188,8 +1405,54 @@ int main(int argc, char* argv[]) {
             } else if (profile_name == "evening_peak" || profile_name == "evening" || profile_name == "eveningpeak") {
                 routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::EVENING_PEAK);
                 std::cout << "Built EVENING_PEAK metric" << std::endl;
+            } else if (profile_name == "walking" || profile_name == "walk") {
+                routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::WALKING);
+                std::cout << "Built WALKING metric" << std::endl;
+            } else if (profile_name == "bus") {
+                routing_data->traffic_modeler->build_and_cache_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::BUS);
+                std::cout << "Built BUS metric" << std::endl;
             } else {
                 std::cerr << "Unknown profile: " << profile_name << ", skipping" << std::endl;
+            }
+        }
+
+        if (routing_data->use_perfect_witness) {
+            PerfectWitnessStatus pw_status = load_perfect_witness_status(cache_base);
+            if (pw_status.exists && !pw_status.enabled && !force_rebuild_perfect_witness) {
+                routing_data->use_perfect_witness = false;
+                std::cout << "Skip perfect-witness build due to cached disabled status. reason='" << pw_status.reason
+                          << "' (use --force-rebuild-perfect-witness=true to retry)" << std::endl;
+            } else {
+                try {
+                    auto &normal_metric = routing_data->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::NORMAL);
+                    long long t = -RoutingKit::get_micro_time();
+                    routing_data->perfect_witness_ch = std::make_unique<RoutingKit::ContractionHierarchy>(
+                        normal_metric.build_contraction_hierarchy_using_perfect_witness_search()
+                    );
+                    t += RoutingKit::get_micro_time();
+
+                    bool valid = validate_perfect_witness(*routing_data->perfect_witness_ch, normal_metric, routing_data->graph.node_count);
+                    if (valid) {
+                        std::cout << "Built and validated perfect-witness CH for normal profile in " << (t / 1000) << " ms." << std::endl;
+                        if (!save_perfect_witness_status(cache_base, true, "validated")) {
+                            std::cerr << "Warning: failed to save perfect_witness_status.txt" << std::endl;
+                        }
+                    } else {
+                        routing_data->perfect_witness_ch.reset();
+                        routing_data->use_perfect_witness = false;
+                        if (!save_perfect_witness_status(cache_base, false, "validation_failed")) {
+                            std::cerr << "Warning: failed to save perfect_witness_status.txt" << std::endl;
+                        }
+                        std::cerr << "Warning: perfect-witness validation failed, fallback to normal CCH." << std::endl;
+                    }
+                } catch (const std::exception &e) {
+                    routing_data->perfect_witness_ch.reset();
+                    routing_data->use_perfect_witness = false;
+                    if (!save_perfect_witness_status(cache_base, false, e.what())) {
+                        std::cerr << "Warning: failed to save perfect_witness_status.txt" << std::endl;
+                    }
+                    std::cerr << "Warning: failed to build perfect-witness CH: " << e.what() << std::endl;
+                }
             }
         }
 
@@ -1200,7 +1463,6 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < bucket_count; ++i) routing_data->bucket_states[i] = std::make_unique<RoutingData::BucketState>();
             const RoutingKit::CustomizableContractionHierarchyMetric &normal_metric = routing_data->traffic_modeler->get_metric(RoutingKit::CCHTrafficModeler::TrafficProfile::NORMAL);
             for (int i = 0; i < bucket_count; ++i) routing_data->time_bucket_metrics[i] = &normal_metric;
-            routing_data->cache_base = cache_base;
             std::cout << "Prepared " << bucket_count << " time-bucket metrics (placeholder -> NORMAL metric)." << std::endl;
             // write small marker files so subsequent runs can detect bucket presence
             for (int i = 0; i < bucket_count; ++i) {

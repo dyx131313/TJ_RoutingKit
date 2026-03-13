@@ -1,4 +1,4 @@
-import { Button, Space, Select, Card, Divider, Typography } from 'antd';
+import { Button, Space, Select, Card, Divider, Typography, Input } from 'antd';
 import {
   EnvironmentOutlined,
   AimOutlined,
@@ -13,7 +13,7 @@ interface RouteControlsProps {}
 
 export function RouteControls({}: RouteControlsProps) {
   const { from, to, selecting, setSelecting } = useMapStore();
-  const { profile, setProfile, ruleId, setRuleId, loading, error, routeResult } = useRouteStore();
+  const { profile, setProfile, ruleId, setRuleId, plate, setPlate, queryDate, setQueryDate, loading, error, routeResult } = useRouteStore();
   const { rules } = useRuleStore();
   const { executeRoute } = useRoute();
 
@@ -65,7 +65,26 @@ export function RouteControls({}: RouteControlsProps) {
               { value: 'normal', label: '正常' },
               { value: 'morning_peak', label: '早高峰' },
               { value: 'evening_peak', label: '晚高峰' },
+              { value: 'walking', label: '步行' },
+              { value: 'bus', label: '公交' },
             ]}
+          />
+        </div>
+
+        {/* 车牌与查询时间 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Text>车牌:</Text>
+          <Input
+            value={plate}
+            onChange={(e) => setPlate(e.target.value)}
+            placeholder="例如: 沪A12345"
+            style={{ width: 160 }}
+          />
+          <Input
+            value={queryDate}
+            onChange={(e) => setQueryDate(e.target.value)}
+            placeholder="查询时间(ISO，可空)"
+            style={{ width: 210 }}
           />
         </div>
 
@@ -132,6 +151,20 @@ export function RouteControls({}: RouteControlsProps) {
                 <Text>沿弧距离: <Text strong>{(routeResult.geo_distance_arcs_meters / 1000).toFixed(2)} km</Text></Text>
               )}
               <Text>预计时间: <Text strong>{Math.round((routeResult.travel_time || routeResult.metric_distance || 0) / 60000)} 分钟</Text></Text>
+              {routeResult.base_travel_time !== undefined && (
+                <Text type="secondary">基础路网时间: {(routeResult.base_travel_time / 60000).toFixed(1)} 分钟</Text>
+              )}
+              {routeResult.metric_travel_time !== undefined && (
+                <Text type="secondary">规则度量时间: {(routeResult.metric_travel_time / 60000).toFixed(1)} 分钟</Text>
+              )}
+              {routeResult.path_coordinates && (
+                <Text type="secondary">途经点: {routeResult.path_coordinates.length} 个</Text>
+              )}
+              {routeResult.path_coordinates && routeResult.path_coordinates.length > 0 && (
+                <Text type="secondary">
+                  路径首末点: {routeResult.path_coordinates[0][0].toFixed(4)},{routeResult.path_coordinates[0][1].toFixed(4)} {' -> '} {routeResult.path_coordinates[routeResult.path_coordinates.length - 1][0].toFixed(4)},{routeResult.path_coordinates[routeResult.path_coordinates.length - 1][1].toFixed(4)}
+                </Text>
+              )}
               {routeResult.metric_unit && (
                 <Text type="secondary">
                   度量: {routeResult.metric_unit} (来源: {routeResult.metric_source || '默认'})

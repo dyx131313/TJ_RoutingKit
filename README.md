@@ -163,8 +163,31 @@ node scripts/migrate.js
 ## 离线地图与路径规划
 
 - 地图瓦片全部本地加载，前端无需外网。
-- 支持多种交通模式（正常/早高峰/晚高峰）切换。
+- 支持多种交通模式（normal/morning_peak/evening_peak/walking/bus）切换。
 - 路径查询结果实时展示于地图。
+
+## 阶段完成情况（2026-03）
+
+- 已完成: P0（路径详情展示、服务常驻）
+- 已完成: P1（路由缓存策略、车牌限行扩展）
+- 已完成: P3（增量更新、多出行方式）
+- 部分完成: P3 完美见证优化（已接入可选开关、校验与自动降级；当前数据集构建不稳定）
+
+参考文档:
+
+- docs/priority.md
+- docs/api.md
+- docs/frontend.md
+- docs/quickstart.md
+- docs/progress-summary-2026-03.md
+
+## 文档导航（精简版）
+
+- docs/quickstart.md: 启动、重启、验收脚本
+- docs/api.md: 后端接口与返回字段说明
+- docs/frontend.md: 前端结构、状态流与交互能力
+- docs/priority.md: 研发优先级与完成状态
+- docs/progress-summary-2026-03.md: 阶段性完成情况总结
 
 ## 已实现的新特性（模板与度量）
 
@@ -200,12 +223,12 @@ curl “http://127.0.0.1:3000/route?from=LAT1,LON1&to=LAT2,LON2&metric_sig=<sig>
 
 本项目支持在前端绘制多边形并”预览影响”的弧段，或对已保存的模板进行预览。
 
-- **判定策略（policy）**：自 2025-10 起，RESOLVE_POLY 采用 `both_inside` 策略，即”仅当一条弧的两个端点都位于多边形内部时，该弧计为受影响”。
+- **判定策略（policy）**：RESOLVE_POLY 当前采用 `inside_or_intersect` 策略，即端点在多边形内部，或弧段与多边形边界相交，都会计为受影响。
   - 后端响应示例（字段节选）：
     ```json
-    { “policy”: “both_inside”, “arc_count”: 14364, “arc_ids”: [...], “arc_coords”: [...] }
+    { "policy": "inside_or_intersect", "arc_count": 14364, "arc_ids": [...], "arc_coords": [...] }
     ```
-  - Node 网关在读取历史缓存时，如发现无 `policy` 或策略不为 `both_inside`，会自动请求后端重算并覆盖旧缓存。
+  - Node 网关在读取历史缓存时，如发现 policy 不受支持，会自动请求后端重算并覆盖旧缓存。
 
 - **缓存位置**：`cache/<pbf-hash>/templates/resolve_poly_<sha256>.json`
   - Key 由多边形坐标（6 位小数）规范化后按顺序拼接并取 SHA-256 生成。
@@ -230,13 +253,16 @@ curl “http://127.0.0.1:3000/route?from=LAT1,LON1&to=LAT2,LON2&metric_sig=<sig>
 GET /route?from=lat,lon&to=lat,lon
 
 # 带profile
-GET /route?from=lat,lon&to=lat,lon&profile=normal|morning_peak|evening_peak
+GET /route?from=lat,lon&to=lat,lon&profile=normal|morning_peak|evening_peak|walking|bus
 
 # 带模板度量
 GET /route?from=lat,lon&to=lat,lon&metric_sig=<signature>
 
 # 带规则
 GET /route?from=lat,lon&to=lat,lon&rule_id=<rule-id>
+
+# 车牌规则判定
+GET /route?from=lat,lon&to=lat,lon&rule_id=<rule-id>&plate=A12345&query_date=2026-03-11T08:30:00
 ```
 
 ### 模板 API
@@ -300,6 +326,13 @@ GET /nearest?lat=lat&lon=lon
 # 解析多边形
 POST /api/resolve_poly
 Body: { “polygon”: [[lat,lon], ...] }
+
+# 清理路由缓存
+POST /api/cache/flush
+
+# 增量更新弧权
+POST /api/graph/update_weights
+Body: { "updates": [{"arc": 102, "weight": 123456}] }
 ```
 
 ---

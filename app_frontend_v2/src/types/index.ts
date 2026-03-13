@@ -1,5 +1,5 @@
 // 交通配置类型
-export type Profile = 'normal' | 'morning_peak' | 'evening_peak';
+export type Profile = 'normal' | 'morning_peak' | 'evening_peak' | 'walking' | 'bus';
 
 // 模板类型
 export type TemplateType = 'polygon' | 'arc_ids' | 'tag_filter';
@@ -17,6 +17,8 @@ export interface RouteResult {
   distance?: number;
   distance_meters?: number;
   travel_time?: number;
+  metric_travel_time?: number;
+  base_travel_time?: number;
   metric_distance?: number;
   metric_source?: string;
   metric_unit?: string;
@@ -50,6 +52,12 @@ export interface Rule {
   metric_path?: string;
   created_at: string;
   updated_at?: string;
+  plate_policy?: {
+    enabled?: boolean;
+    tails?: string[];
+    weekdays?: number[];
+    time_windows?: Array<{ start: string; end: string }>;
+  };
 }
 
 // 多边形解析结果

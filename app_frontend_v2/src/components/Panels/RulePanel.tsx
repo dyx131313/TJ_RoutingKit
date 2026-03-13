@@ -6,6 +6,8 @@ import {
   Table,
   Tag,
   Input,
+  Switch,
+  Checkbox,
   Typography,
   message,
   Popconfirm,
@@ -34,6 +36,11 @@ export function RulePanel({ open = false, onClose = () => {}, onSelectRule, embe
   const { selectedSignatures } = useTemplateStore();
   const [newRuleName, setNewRuleName] = useState('');
   const [creating, setCreating] = useState(false);
+  const [plateEnabled, setPlateEnabled] = useState(false);
+  const [tailsInput, setTailsInput] = useState('');
+  const [weekdays, setWeekdays] = useState<number[]>([1, 2, 3, 4, 5]);
+  const [timeStart, setTimeStart] = useState('07:00');
+  const [timeEnd, setTimeEnd] = useState('20:00');
 
   // 创建规则
   const handleCreate = async () => {
@@ -53,6 +60,12 @@ export function RulePanel({ open = false, onClose = () => {}, onSelectRule, embe
       await createRule({
         name: newRuleName,
         templates: Array.from(selectedSignatures),
+        plate_policy: plateEnabled ? {
+          enabled: true,
+          tails: tailsInput.split(',').map(s => s.trim()).filter(Boolean),
+          weekdays,
+          time_windows: [{ start: timeStart, end: timeEnd }],
+        } : undefined,
       });
       message.success('规则创建成功');
       setNewRuleName('');
@@ -172,6 +185,38 @@ export function RulePanel({ open = false, onClose = () => {}, onSelectRule, embe
           <Text type="secondary">
             已选模板: {selectedSignatures.size} 个
           </Text>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Text>启用车牌限行:</Text>
+            <Switch checked={plateEnabled} onChange={setPlateEnabled} />
+          </div>
+
+          {plateEnabled && (
+            <Space orientation="vertical" style={{ width: '100%' }} size="small">
+              <Input
+                value={tailsInput}
+                onChange={e => setTailsInput(e.target.value)}
+                placeholder="限行尾号，逗号分隔，例如: 1,3,5"
+              />
+              <Checkbox.Group
+                value={weekdays}
+                onChange={(v) => setWeekdays((v as number[]).map(Number))}
+                options={[
+                  { label: '周一', value: 1 },
+                  { label: '周二', value: 2 },
+                  { label: '周三', value: 3 },
+                  { label: '周四', value: 4 },
+                  { label: '周五', value: 5 },
+                  { label: '周六', value: 6 },
+                  { label: '周日', value: 7 },
+                ]}
+              />
+              <Space>
+                <Input value={timeStart} onChange={e => setTimeStart(e.target.value)} placeholder="开始 HH:MM" style={{ width: 120 }} />
+                <Input value={timeEnd} onChange={e => setTimeEnd(e.target.value)} placeholder="结束 HH:MM" style={{ width: 120 }} />
+              </Space>
+            </Space>
+          )}
 
           <Button
             type="primary"

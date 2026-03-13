@@ -3,6 +3,7 @@ const net = require('net');
 const path = require('path');
 const monitor = require('express-status-monitor');
 const cors = require('cors');
+const Redis = require('ioredis');
 
 // 内存监控
 const { createFullMemoryMonitor, getMemoryUsage, findCppServerProcess } = require('./utils/memoryMonitor.js');
@@ -15,6 +16,131 @@ const port = 3000;
 // C++ TCP 服务器的配置
 const CPP_SERVER_HOST = '127.0.0.1';
 const CPP_SERVER_PORT = 12345;
+const ROUTE_CACHE_TTL_SEC = Number(process.env.ROUTE_CACHE_TTL_SEC || 120);
+
+let redisClient = null;
+let redisReady = false;
+const memoryRouteCache = new Map();
+
+function initRedis() {
+    try {
+        redisClient = new Redis({
+            host: process.env.REDIS_HOST || '127.0.0.1',
+            port: Number(process.env.REDIS_PORT || 6379),
+            lazyConnect: true,
+            maxRetriesPerRequest: 1,
+            enableOfflineQueue: false,
+        });
+        redisClient.on('ready', () => { redisReady = true; console.log('[cache] Redis connected'); });
+        redisClient.on('error', (e) => { redisReady = false; console.warn('[cache] Redis error:', e.message); });
+        redisClient.connect().catch((e) => {
+            redisReady = false;
+            console.warn('[cache] Redis connect failed, fallback to memory cache:', e.message);
+        });
+    } catch (e) {
+        redisReady = false;
+        console.warn('[cache] Redis init failed, fallback to memory cache:', e.message);
+    }
+}
+initRedis();
+
+function buildRouteCacheKey(q, effectiveMetricSig) {
+    return [
+        'route:v2',
+        q.from || '',
+        q.to || '',
+        q.profile || 'normal',
+        q.time || '',
+        q.rule_id || '',
+        q.metric_sig || '',
+        effectiveMetricSig || '',
+        q.plate || '',
+        q.query_date || '',
+    ].join('|');
+}
+
+async function routeCacheGet(key) {
+    if (redisReady && redisClient) {
+        const raw = await redisClient.get(key);
+        if (!raw) return null;
+        try { return JSON.parse(raw); } catch (_) { return null; }
+    }
+    const v = memoryRouteCache.get(key);
+    if (!v) return null;
+    if (Date.now() > v.expireAt) {
+        memoryRouteCache.delete(key);
+        return null;
+    }
+    return v.body;
+}
+
+async function routeCacheSet(key, body) {
+    if (redisReady && redisClient) {
+        await redisClient.setex(key, ROUTE_CACHE_TTL_SEC, JSON.stringify(body));
+        return;
+    }
+    memoryRouteCache.set(key, { body, expireAt: Date.now() + ROUTE_CACHE_TTL_SEC * 1000 });
+}
+
+async function routeCacheFlush() {
+    memoryRouteCache.clear();
+    if (redisReady && redisClient) {
+        const keys = await redisClient.keys('route:v2*');
+        if (keys.length > 0) await redisClient.del(keys);
+    }
+}
+
+function parseDateLike(s) {
+    if (!s) return new Date();
+    const d = new Date(String(s));
+    if (Number.isNaN(d.getTime())) return new Date();
+    return d;
+}
+
+function parseHHMM(s) {
+    if (!s || typeof s !== 'string') return null;
+    const m = s.match(/^(\d{2}):(\d{2})$/);
+    if (!m) return null;
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+    return h * 60 + min;
+}
+
+function isPlatePolicyActive(platePolicy, query) {
+    if (!platePolicy || !platePolicy.enabled) return true;
+    const plate = String(query.plate || '').trim().toUpperCase();
+    if (!plate) return false;
+    const tail = plate.slice(-1);
+    const tails = Array.isArray(platePolicy.tails) ? platePolicy.tails.map((x) => String(x)) : [];
+    if (tails.length > 0 && !tails.includes(tail)) return false;
+
+    const d = parseDateLike(query.query_date || query.time);
+    const jsDay = d.getDay();
+    const weekday = jsDay === 0 ? 7 : jsDay;
+    const weekdays = Array.isArray(platePolicy.weekdays) ? platePolicy.weekdays.map((x) => Number(x)) : [];
+    if (weekdays.length > 0 && !weekdays.includes(weekday)) return false;
+
+    const nowMinutes = d.getHours() * 60 + d.getMinutes();
+    const windows = Array.isArray(platePolicy.time_windows) ? platePolicy.time_windows : [];
+    if (windows.length > 0) {
+        let inWindow = false;
+        for (const w of windows) {
+            const start = parseHHMM(w && w.start);
+            const end = parseHHMM(w && w.end);
+            if (start == null || end == null) continue;
+            if (start <= end) {
+                if (nowMinutes >= start && nowMinutes <= end) inWindow = true;
+            } else {
+                if (nowMinutes >= start || nowMinutes <= end) inWindow = true;
+            }
+            if (inWindow) break;
+        }
+        if (!inWindow) return false;
+    }
+
+    return true;
+}
 
 // Enable CORS for all origins (development)
 app.use(cors());
@@ -29,7 +155,7 @@ app.get('/', (req, res) => {
     res.sendFile(path.resolve(__dirname, '../app_frontend/index.html'));
 });
 
-function handle_request(req, res) {
+function handle_request(req, res, forcedMetricSig = undefined) {
     const { from, to, profile, time } = req.query;
     const profile_str = profile || 'normal';
     const time_param = time || '';
@@ -40,7 +166,9 @@ function handle_request(req, res) {
         console.log('已连接到 C++ 路由计算服务');
     // support optional metric_sig query parameter to apply a custom metric
     // also accept rule_id as a shortcut to refer to a built merged metric
-    const metric_sig = req.query.metric_sig || req.query.rule_id || '';
+    const metric_sig = (forcedMetricSig !== undefined)
+        ? forcedMetricSig
+        : (req.query.metric_sig || req.query.rule_id || '');
         let request_str = time_param ? `${from},${to},${profile_str},${time_param}` : `${from},${to},${profile_str}`;
         if (metric_sig) request_str = request_str + `,metric_sig:${metric_sig}`;
         // ensure newline termination so backend can rely on it
@@ -99,10 +227,29 @@ app.get('/route', (req, res) => {
     console.log('rule_id:', rule_id);
     if (rule_id) {
         (async () => {
+            let effectiveMetricSig = '';
             try {
+                const r = readRule(rule_id);
+                if (!r) {
+                    return res.status(404).json({ error: `rule not found: ${rule_id}` });
+                }
+                const active = isPlatePolicyActive(r.plate_policy, req.query);
+                if (!active) {
+                    console.log('rule inactive under plate policy, fallback to base profile:', rule_id);
+                    const key = buildRouteCacheKey(req.query, '');
+                    const cached = await routeCacheGet(key);
+                    if (cached) return res.json(cached);
+                    const originalJson = res.json.bind(res);
+                    res.json = (body) => {
+                        if (body && !body.error) routeCacheSet(key, body).catch(() => {});
+                        return originalJson(body);
+                    };
+                    return handle_request(req, res, '');
+                }
                 // attempt to build metric for rule (if already built, buildMetricForRule will update metadata)
                 const br = await buildMetricForRule(rule_id, undefined);
                 console.log('Metric built:', br);
+                effectiveMetricSig = rule_id;
                 // ensure metric_sig_<rule_id>.bin exists alongside metric_rule_<rule_id>.bin
                 const outdir = path.join(path.resolve(__dirname, '..', 'cache'), PBF_HASH);
                 console.log('Outdir:', outdir);
@@ -117,12 +264,39 @@ app.get('/route', (req, res) => {
                 console.error('route: failed to build/ensure rule metric', e.message || e);
                 // continue — route may still be computed without rule metric
             }
-            handle_request(req, res);
+            const key = buildRouteCacheKey(req.query, effectiveMetricSig);
+            const cached = await routeCacheGet(key);
+            if (cached) return res.json(cached);
+            const originalJson = res.json.bind(res);
+            res.json = (body) => {
+                if (body && !body.error) routeCacheSet(key, body).catch(() => {});
+                return originalJson(body);
+            };
+            handle_request(req, res, effectiveMetricSig);
         })();
         return;
     }
 
-    handle_request(req, res);
+    (async () => {
+        const key = buildRouteCacheKey(req.query, '');
+        const cached = await routeCacheGet(key);
+        if (cached) return res.json(cached);
+        const originalJson = res.json.bind(res);
+        res.json = (body) => {
+            if (body && !body.error) routeCacheSet(key, body).catch(() => {});
+            return originalJson(body);
+        };
+        handle_request(req, res, '');
+    })();
+});
+
+app.post('/api/cache/flush', async (_req, res) => {
+    try {
+        await routeCacheFlush();
+        res.json({ ok: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message || 'cache flush failed' });
+    }
 });
 
 app.get('/health', async (_req, res) => {
@@ -400,7 +574,8 @@ app.post('/api/resolve_poly', (req, res) => {
             const cached = JSON.parse(fs.readFileSync(cache_file, 'utf8'));
             // If cached arc_coords are present but appear truncated (legacy 500-cap), force recompute
             const legacy_truncated = cached && Array.isArray(cached.arc_coords) && Number.isInteger(cached.arc_count) && cached.arc_coords.length < cached.arc_count;
-            const policy_mismatch = !cached || (cached.policy && cached.policy !== 'both_inside') || (!cached.policy);
+            const supportedPolicies = new Set(['both_inside', 'inside_or_intersect']);
+            const policy_mismatch = !cached || !cached.policy || !supportedPolicies.has(cached.policy);
             if (legacy_truncated || policy_mismatch) {
                 console.log('resolve_poly: detected partial cached arc_coords (', cached.arc_coords.length, '/', cached.arc_count, '), recomputing...');
                 // fall through to recompute below
@@ -647,6 +822,7 @@ app.post('/api/templates/:sig/build', async (req, res) => {
         buf.writeBigUInt64LE(BigInt(weights.length), 0);
         for (let i = 0; i < weights.length; ++i) buf.writeUInt32LE(weights[i], 8 + i*4);
         fs.writeFileSync(outpath, buf);
+        await routeCacheFlush().catch(() => {});
         return res.json({ built: true, path: outpath, affected_count: affected.length });
     } catch (e) {
         console.error('failed to write metric_sig file', e);
@@ -660,7 +836,14 @@ app.post('/api/rules', (req, res) => {
     const body = req.body;
     if (!body || !Array.isArray(body.templates)) return res.status(400).json({ error: 'body must include templates: [sig,...]' });
     const id = body.id || generateRuleId();
-    const rule = { id, name: body.name || `rule-${id}`, description: body.description || '', templates: body.templates, created_at: new Date().toISOString() };
+    const rule = {
+        id,
+        name: body.name || `rule-${id}`,
+        description: body.description || '',
+        templates: body.templates,
+        plate_policy: body.plate_policy || null,
+        created_at: new Date().toISOString(),
+    };
     if (!writeRule(rule)) return res.status(500).json({ error: 'failed to write rule' });
     res.json(rule);
 });
@@ -688,7 +871,11 @@ app.put('/api/rules/:id', (req, res) => {
     const id = req.params.id; const body = req.body;
     const r = readRule(id);
     if (!r) return res.status(404).json({ error: 'not found' });
-    r.name = body.name || r.name; r.description = body.description || r.description; r.templates = Array.isArray(body.templates) ? body.templates : r.templates; r.updated_at = new Date().toISOString();
+    r.name = body.name || r.name;
+    r.description = body.description || r.description;
+    r.templates = Array.isArray(body.templates) ? body.templates : r.templates;
+    r.plate_policy = body.plate_policy || r.plate_policy || null;
+    r.updated_at = new Date().toISOString();
     if (!writeRule(r)) return res.status(500).json({ error: 'failed to write' });
     res.json(r);
 });
@@ -707,11 +894,51 @@ app.post('/api/rules/:id/build', async (req, res) => {
     try {
         const r = readRule(id); if (!r) return res.status(404).json({ error: 'not found' });
         const result = await buildMetricForRule(id, big);
+        await routeCacheFlush().catch(() => {});
         res.json({ built: true, path: result.path, affected_count: result.affected_count });
     } catch (e) {
         console.error('rule build error', e);
         res.status(500).json({ error: e.message });
     }
+});
+
+// Incremental update: update selected arc weights in C++ runtime without full reload
+app.post('/api/graph/update_weights', (req, res) => {
+    const body = req.body || {};
+    const updates = Array.isArray(body.updates) ? body.updates : [];
+    if (updates.length === 0) {
+        return res.status(400).json({ error: 'updates is required and must be non-empty' });
+    }
+    let cmd = 'UPDATE_ARCS';
+    for (const u of updates) {
+        const arc = Number(u.arc);
+        const weight = Number(u.weight);
+        if (!Number.isInteger(arc) || arc < 0 || !Number.isFinite(weight) || weight <= 0) {
+            return res.status(400).json({ error: 'invalid update item, expected {arc:int>=0, weight:number>0}' });
+        }
+        cmd += `,${arc},${Math.floor(weight)}`;
+    }
+    cmd += '\n';
+
+    const client = new net.Socket();
+    client.connect(CPP_SERVER_PORT, CPP_SERVER_HOST, () => client.write(cmd));
+    let buf = '';
+    client.on('data', (data) => {
+        buf += data.toString();
+        if (buf.includes('\n')) {
+            try {
+                const out = JSON.parse(buf);
+                if (!out.error) routeCacheFlush().catch(() => {});
+                res.status(out.error ? 500 : 200).json(out);
+            } catch (e) {
+                res.status(500).json({ error: 'invalid response from backend' });
+            }
+            client.end();
+        }
+    });
+    client.on('error', (err) => {
+        res.status(503).json({ error: `C++ service unavailable: ${err.message}` });
+    });
 });
 
 app.get('/api/templates', (req, res) => {
@@ -817,7 +1044,8 @@ app.get('/api/templates/:sig/preview', (req, res) => {
                 try { d = JSON.parse(fs.readFileSync(cache_file,'utf8')); } catch(e) { d = null; }
                 // If cache exists but arc_coords look truncated, recompute via C++ and refresh cache
                 const needRecompute = !!(d && Array.isArray(d.arc_coords) && Number.isInteger(d.arc_count) && d.arc_coords.length < d.arc_count);
-                const policyMismatch = !d || (d.policy && d.policy !== 'both_inside') || (!d.policy);
+                const supportedPolicies = new Set(['both_inside', 'inside_or_intersect']);
+                const policyMismatch = !d || !d.policy || !supportedPolicies.has(d.policy);
                 if (!needRecompute && !policyMismatch && d) {
                     result.precomputed = true;
                     if (Array.isArray(d.arc_coords) && d.arc_coords.length > 0) result.preview = { arc_coords: d.arc_coords };

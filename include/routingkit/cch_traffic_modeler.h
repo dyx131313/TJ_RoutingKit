@@ -24,7 +24,9 @@ public:
     enum class TrafficProfile {
         NORMAL,
         MORNING_PEAK,
-        EVENING_PEAK
+        EVENING_PEAK,
+        WALKING,
+        BUS
     };
 
     // Constructor takes the CCH topology and the base graph data required for modeling

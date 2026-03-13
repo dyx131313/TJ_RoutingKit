@@ -10,7 +10,7 @@ const GB = 1024 * MB;
 /**
  * 获取当前内存使用情况
  */
-export function getMemoryUsage() {
+function getMemoryUsage() {
   const usage = process.memoryUsage();
   return {
     heapUsed: Math.round(usage.heapUsed / MB),
@@ -23,7 +23,7 @@ export function getMemoryUsage() {
 /**
  * 格式化内存大小
  */
-export function formatMemory(bytes) {
+function formatMemory(bytes) {
   if (bytes >= GB) {
     return (bytes / GB).toFixed(2) + ' GB';
   }
@@ -35,7 +35,7 @@ export function formatMemory(bytes) {
  * @param intervalMs 监控间隔（毫秒），默认 30000 (30秒)
  * @param thresholdMB 内存警告阈值（MB），默认 500MB
  */
-export function createMemoryMonitor(intervalMs = 30000, thresholdMB = 500) {
+function createMemoryMonitor(intervalMs = 30000, thresholdMB = 500) {
   const interval = setInterval(() => {
     const mem = getMemoryUsage();
     const totalMem = mem.rss;
@@ -65,7 +65,7 @@ export function createMemoryMonitor(intervalMs = 30000, thresholdMB = 500) {
 /**
  * 检查系统内存状态
  */
-export function getSystemMemory() {
+function getSystemMemory() {
   // 这是一个简化的实现，实际应该通过 OS 模块获取
   const mem = process.memoryUsage();
   return {
@@ -129,7 +129,7 @@ function getProcessMemory(pid) {
  * 查找 C++ 路由服务器进程
  * @returns {Promise<{pid: number, rss: number, vsz: number, cpu: number, mem: number}|null>}
  */
-export async function findCppServerProcess() {
+async function findCppServerProcess() {
   const port = 12345; // C++ 服务器端口
   const pid = await findPidByPort(port);
   if (!pid) {
@@ -148,7 +148,7 @@ export async function findCppServerProcess() {
  * @param {number} thresholdMB 内存警告阈值（MB）
  * @param {number} cppThresholdMB C++ 进程内存警告阈值（MB）
  */
-export function createFullMemoryMonitor(intervalMs = 30000, thresholdMB = 500, cppThresholdMB = 2000) {
+function createFullMemoryMonitor(intervalMs = 30000, thresholdMB = 500, cppThresholdMB = 2000) {
   const interval = setInterval(async () => {
     // 监控 Node.js 进程
     const nodeMem = getMemoryUsage();
@@ -186,7 +186,7 @@ export function createFullMemoryMonitor(intervalMs = 30000, thresholdMB = 500, c
   };
 }
 
-export default {
+module.exports = {
   getMemoryUsage,
   formatMemory,
   createMemoryMonitor,
